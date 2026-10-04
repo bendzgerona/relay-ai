@@ -1,0 +1,208 @@
+// src/core/model.ts — construct a ready Vercel AI SDK LanguageModel from a route id.
+
+import type { LanguageModel } from 'ai';
+import {
+  resolveProviderCredential,
+  resolveProviderOAuthAccountId,
+  resolveProviderOAuthProviderData,
+} from '../env.js';
+import { createLanguageModel, type ProviderModelSpec } from '../provider-factory.js';
+import { providerRefreshToken } from '../provider-runtime.js';
+import type { CachedModel, RegistryProvider } from '../registry/types.js';
+import { getProviderModels } from '../registry/provider-models.js';
+import { reconcileCachedModelProtocol } from '../registry/model-protocol.js';
+import { createAntigravityCloudCodeModel } from './antigravity-model.js';
+import { loadCoreRegistry } from './catalog.js';
+import { RelayCoreError, isRelayCoreError } from './errors.js';
+import { reasoningNpmForRoute, resolveReasoningProviderOptions, withReasoningProviderOptions, type RelayProviderOptions } from './reasoning.js';
+import { withRequestHeaders } from './reasoning.js';
+import { normalizeToolSchemaForNpm } from '../tool-schema.js';
+import { parseRelayRouteId } from './route-id.js';
+import type { CreateRelayModelOptions, RelayRouteId } from './types.js';
+import { openCodeGoHeaders } from '../opencode-session.js';
+
+/**
+ * Rewrite tool schemas on every Core call. CLI proxies do this in their
+ * adapters; Core hands back a plain model, so Alef's tools never passed
+ * through that step and Command Code rejected Claude-shaped `pattern` values.
+ */
+export async function withPortableToolSchemas(model: LanguageModel, npm: string | undefined): Promise<LanguageModel> {
+  const { wrapLanguageModel } = await import('ai');
+  type WrapArgs = Parameters<typeof wrapLanguageModel>[0];
+  return wrapLanguageModel({
+    model: model as WrapArgs['model'],
+    middleware: {
+      specificationVersion: 'v4',
+      transformParams: async ({ params }) => {
+        const tools = params.tools;
+        if (!tools?.length) return params;
+        let changed = false;
+        const next = tools.map(entry => {
+          if (entry.type !== 'function' || !entry.inputSchema || typeof entry.inputSchema !== 'object') return entry;
+          const inputSchema = normalizeToolSchemaForNpm(entry.inputSchema, npm);
+          if (inputSchema === entry.inputSchema) return entry;
+          changed = true;
+          return { ...entry, inputSchema };
+        });
+        return changed ? { ...params, tools: next } : params;
+      },
+    },
+  });
+}
+
+function isAntigravityCloudCodeRoute(provider: RegistryProvider, model: CachedModel): boolean {
+  return provider.id === 'antigravity'
+    && provider.authType === 'oauth'
+    && model.modelFormat === 'cloud-code';
+}
+
+function findRoute(registry: ReturnType<typeof loadCoreRegistry>, providerId: string, modelId: string, routeId: RelayRouteId): { provider: RegistryProvider; model: CachedModel } {
+  const provider = registry.providers.find(p => p.id === providerId);
+  if (!provider) {
+    throw new RelayCoreError('ROUTE_NOT_FOUND', `No provider registered with id "${providerId}".`, { providerId, routeId });
+  }
+  if (!provider.enabled) {
+    throw new RelayCoreError('PROVIDER_DISABLED', `Provider "${provider.name}" is disabled — enable it in relay-ai ui.`, { providerId, routeId });
+  }
+  const model = getProviderModels(provider).find(m => m.id === modelId);
+  if (!model) {
+    throw new RelayCoreError('UNSUPPORTED_MODEL', `Provider "${provider.name}" has no cached model "${modelId}" — refresh its models in relay-ai ui.`, { providerId, routeId });
+  }
+  return { provider, model };
+}
+
+async function resolveCredential(provider: RegistryProvider, routeId: RelayRouteId): Promise<string> {
+  try {
+    const credential = await resolveProviderCredential(provider.id, provider.authRef);
+    if (credential) return credential;
+    if (provider.authType === 'none') return '';
+    throw new RelayCoreError(
+      'CREDENTIAL_UNAVAILABLE',
+      `No credential available for provider "${provider.name}" — re-authenticate in relay-ai ui.`,
+      { providerId: provider.id, routeId },
+    );
+  } catch (err) {
+    if (isRelayCoreError(err)) throw err;
+    if (provider.authType === 'oauth') {
+      throw new RelayCoreError(
+        'OAUTH_REFRESH_FAILED',
+        `OAuth token refresh failed for provider "${provider.name}" — re-authenticate in relay-ai ui.`,
+        { providerId: provider.id, routeId, cause: err },
+      );
+    }
+    throw new RelayCoreError(
+      'PROVIDER_LOAD_FAILED',
+      `Failed to resolve the credential for provider "${provider.name}".`,
+      { providerId: provider.id, routeId, cause: err },
+    );
+  }
+}
+
+/**
+ * Build a ready Vercel AI SDK `LanguageModel` for a `provider::model` route id.
+ *
+ * Re-reads the registry, credentials, and OAuth state on every call — nothing is
+ * cached across calls, so a provider disabled or re-authenticated after the last
+ * call takes effect without restarting the consumer process. Credentials are
+ * resolved (and OAuth tokens refreshed) by Relay's existing machinery; the
+ * credential and the intermediate spec never leave this function.
+ */
+export async function createRelayModel(routeId: RelayRouteId, options?: CreateRelayModelOptions): Promise<LanguageModel> {
+  const { providerId, modelId } = parseRelayRouteId(routeId);
+  const registry = loadCoreRegistry();
+  const found = findRoute(registry, providerId, modelId, routeId);
+  const provider = found.provider;
+  const model = reconcileCachedModelProtocol(found.model, provider);
+
+  // Resolved before any credential work so an unsupported level fails fast and
+  // without touching the keyring or the network.
+  const reasoningOptions: RelayProviderOptions | undefined = options?.reasoning === undefined
+    ? undefined
+    : resolveReasoningProviderOptions(options.reasoning, provider, model, routeId);
+  const transportHeaders = openCodeGoHeaders(
+    provider.id,
+    model.apiUrl ?? provider.api.url,
+    options?.sessionId,
+    provider.api.headers,
+    // The returned model may be reused across conversations, so never fabricate a
+    // session here — a baked-in id would blend histories. The host passes sessionId.
+    { generateFallbackSession: false },
+  );
+  const finish = async (built: LanguageModel, schemaNpm?: string): Promise<LanguageModel> => {
+    let finished = await withPortableToolSchemas(built, schemaNpm);
+    if (reasoningOptions) finished = await withReasoningProviderOptions(finished, reasoningOptions);
+    if (transportHeaders) finished = await withRequestHeaders(finished, transportHeaders);
+    return finished;
+  };
+
+  if (isAntigravityCloudCodeRoute(provider, model)) {
+    const apiKey = await resolveCredential(provider, routeId);
+    const providerData = await resolveProviderOAuthProviderData(provider.authRef);
+    const projectId = typeof providerData?.projectId === 'string' ? providerData.projectId.trim() : '';
+    if (!projectId) {
+      throw new RelayCoreError(
+        'CREDENTIAL_UNAVAILABLE',
+        `Provider "${provider.name}" is missing project metadata — re-authenticate in relay-ai ui.`,
+        { providerId: provider.id, routeId },
+      );
+    }
+    try {
+      return await finish(await createAntigravityCloudCodeModel({
+        modelId: model.upstreamModelId ?? model.id,
+        accessToken: apiKey,
+        projectId,
+        refreshToken: providerRefreshToken(provider.id, provider.authType, provider.authRef),
+        ...(options?.onDebug ? { onDebug: options.onDebug } : {}),
+        ...(options?.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
+      }), reasoningNpmForRoute(provider, model));
+    } catch (err) {
+      if (isRelayCoreError(err)) throw err;
+      throw new RelayCoreError(
+        'PROVIDER_LOAD_FAILED',
+        `Failed to construct model "${modelId}" for provider "${provider.name}".`,
+        { providerId, routeId, cause: err },
+      );
+    }
+  }
+
+  const npm = model.npm ?? provider.api.npm;
+  if (!npm) {
+    throw new RelayCoreError('UNSUPPORTED_MODEL', `Model "${modelId}" has no SDK provider package — refresh the provider's models in relay-ai ui.`, { providerId, routeId });
+  }
+
+  const apiKey = await resolveCredential(provider, routeId);
+
+  let oauthAccountId: string | undefined;
+  let providerData: Record<string, unknown> | undefined;
+  if (provider.authType === 'oauth') {
+    oauthAccountId = await resolveProviderOAuthAccountId(provider.authRef);
+    providerData = await resolveProviderOAuthProviderData(provider.authRef);
+  }
+
+  const spec: ProviderModelSpec = {
+    npm,
+    modelId: model.upstreamModelId ?? model.id,
+    apiKey,
+    baseURL: model.apiUrl ?? provider.api.url,
+    providerId: provider.id,
+    authType: provider.authType,
+    oauthAccountId,
+    providerData,
+    headers: provider.api.headers,
+    refreshToken: providerRefreshToken(provider.id, provider.authType, provider.authRef),
+    useResponsesLite: model.useResponsesLite,
+    preferWebSockets: model.preferWebSockets,
+    ...(options?.onDebug ? { onDebug: options.onDebug } : {}),
+  };
+
+  try {
+    return await finish(await createLanguageModel(spec), npm);
+  } catch (err) {
+    if (isRelayCoreError(err)) throw err;
+    throw new RelayCoreError(
+      'PROVIDER_LOAD_FAILED',
+      `Failed to construct model "${modelId}" for provider "${provider.name}".`,
+      { providerId, routeId, cause: err },
+    );
+  }
+}

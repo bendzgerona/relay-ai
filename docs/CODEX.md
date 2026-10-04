@@ -1,0 +1,495 @@
+# Codex with relay-ai
+
+Use **OpenAI Codex** (terminal CLI or desktop app) with models from your relay-ai registry — Anthropic, xAI, Google Gemini, Nvidia, DeepSeek, OpenAI, and more.
+
+| Command | What it launches | Config target |
+|---------|------------------|---------------|
+| **`relay-ai codex`** | Codex **terminal** (TUI) | Temporary sidecar profile — never touches your main Codex config |
+| **`relay-ai codex-app`** | Codex **desktop app** (macOS / Windows / Linux) | Patches `~/.codex/config.toml` with backup; restored on Ctrl+C |
+
+Both commands use the same registry (`~/.relay-ai/providers.json`) and provider picker. The CLI uses OpenAI directly when possible; the desktop app always uses the local Responses proxy so it can keep Codex's built-in provider identity and preserve history visibility.
+
+**Full flag reference:** `relay-ai codex --help` and `relay-ai codex-app --help`. This guide explains *how it works*, *what files are touched*, and *how to recover*.
+
+**Agent / alef-agent integration** (boot flags, NDJSON, `exec --json`): see **[AI-AGENTS.md](AI-AGENTS.md)** or run `relay-ai --ai`.
+
+---
+
+## Prerequisites
+
+1. **relay-ai** installed on your PATH (`npm install -g @jacobbd/relay-ai`, or built locally with `npm run build && npm link`).
+2. **At least one provider** in the registry:
+   ```bash
+   relay-ai providers add
+   # or: relay-ai providers import
+   ```
+3. **Codex installed:**
+   - **CLI:** `npm install -g @openai/codex` (required for `relay-ai codex`)
+   - **Desktop app:** [ChatGPT desktop app with Codex](https://developers.openai.com/codex/cli) for macOS, Windows, or Linux (required for `relay-ai codex-app`)
+
+**Supported in Codex:** registry providers plus OpenCode Zen/Go cloud backends route through relay-ai's local Responses proxy.
+
+---
+
+## How it works (both commands)
+
+Codex speaks the **OpenAI Responses API** (`POST /v1/responses`). Most registry providers do not. relay-ai bridges the gap:
+
+```
+Codex  →  relay-ai Responses proxy (127.0.0.1, Tier 2)  →  Vercel AI SDK  →  Anthropic / xAI / Gemini / …
+Codex  →  OpenAI directly (Tier 1, OpenAI only)
+```
+
+| Tier | Providers | What relay-ai does |
+|------|-----------|-------------------|
+| **Tier 1 — Direct** | OpenAI (API key or ChatGPT OAuth) | Points Codex at OpenAI; no local proxy |
+| **Tier 2 — Proxy** | Anthropic, xAI, Gemini, Nvidia, DeepSeek, most others | Local HTTP server translates Responses ↔ upstream SDK |
+
+Your real API keys stay in relay-ai (keychain / registry). The proxy holds them in memory for the session.
+
+---
+
+## Codex CLI (`relay-ai codex`)
+
+### Quick start
+
+```bash
+relay-ai codex
+```
+
+Pick provider → pick model → Codex TUI opens. relay-ai runs:
+
+```bash
+codex --profile relay-ai-launch -m <model-id>
+```
+
+### relay-ai flags
+
+| Flag | Purpose |
+|------|---------|
+| *(none)* | Interactive launch |
+| `--restore` | Remove leftover relay-ai CLI files after a crash |
+| `--config` | Write profile + catalog to disk, print paths, exit (no Codex launch) |
+| `--help` | Help text |
+
+relay-ai **manages** `--profile` and `-m` / `--model`. Sandbox defaults to `danger-full-access`; pass other Codex flags directly:
+
+```bash
+relay-ai codex -s workspace-write
+```
+
+You do **not** need `--` before `-s`.
+
+### Files relay-ai owns (CLI)
+
+| File | Purpose |
+|------|---------|
+| `~/.codex/relay-ai-launch.config.toml` | Temporary profile for this session |
+| `~/.relay-ai/codex/models-<provider>.json` | Model catalog |
+| `~/.relay-ai/codex/session.json` | Session lock (one CLI session at a time) |
+
+relay-ai **never edits** `~/.codex/config.toml` for CLI launches. Your personal Codex settings (sandbox, approvals, etc.) stay in that file and still apply.
+
+### Cleanup (CLI)
+
+| Situation | What happens |
+|-----------|----------------|
+| Normal exit (Codex quits, including Ctrl+C in Codex) | relay-ai removes overlay files automatically |
+| Crash / closed terminal / force-quit | Files may remain; next launch auto-recovers when possible |
+| Manual cleanup | `relay-ai codex --restore` |
+
+You’ll see a **Cleanup** note before launch and a short message after exit.
+
+### What relay-ai injects (CLI)
+
+| Variable | When | Why |
+|----------|------|-----|
+| `RELAY_AI_CODEX_KEY=proxy-local` | Tier 2 only | Placeholder so Codex hits the local proxy; real key stays in the proxy |
+| `OPENAI_API_KEY` (etc.) | Tier 1 OpenAI | Codex calls OpenAI natively |
+
+relay-ai **strips CI-related env vars** (`CI`, `CODEX_CI`, `GITHUB_ACTIONS`, …) before spawning Codex so IDE terminals don’t accidentally force read-only CI mode.
+
+**Not from relay-ai:** `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED`, etc. — those are set by Codex when it runs shell commands. `RELAY_AI_CODEX_KEY` does **not** control sandbox policy.
+
+### Sandbox and network (CLI)
+
+Two layers people confuse:
+
+1. **Codex’s sandbox** — shell commands inside Codex (files, network, approvals). Lives in `~/.codex/config.toml` and Codex CLI flags.
+2. **relay-ai’s proxy** — model API traffic only.
+
+**relay-ai codex defaults to `danger-full-access`** — the launch profile and spawn args both set it so shell tools (`curl`, `nlm`, npm, MCP CLIs) can reach the network without you passing `-s` every time. Override for one session:
+
+```bash
+relay-ai codex -s workspace-write
+```
+
+relay-ai **does not** edit your personal `~/.codex/config.toml` for CLI launches. To change sandbox for bare `codex` (without relay-ai), edit that file yourself:
+
+```toml
+sandbox = "danger-full-access"
+ask_for_approval = "never"
+
+[shell_environment_policy]
+inherit = "all"
+```
+
+On macOS, profile TOML alone may not be enough; relay-ai also passes `-s danger-full-access` on spawn ([Codex #10390](https://github.com/openai/codex/issues/10390)).
+
+---
+
+## Codex desktop app (`relay-ai codex-app`)
+
+### Quick start
+
+```bash
+relay-ai codex-app
+```
+
+For unattended startup, specify every launch choice and add `--yes`:
+
+```bash
+relay-ai codex-app --provider antigravity --model gemini-3.1-pro-high --with-native --yes
+```
+
+`--yes` bypasses the launch and restart confirmations. To prevent an unattended
+launch from relying on saved or default choices, it requires `--provider`,
+`--model`, and either `--with-native` or `--relay-only`.
+
+Pick provider → pick model → Codex **app** opens. **Keep the relay-ai terminal open** until you’re done (the app always uses the foreground proxy). Press **Ctrl+C** to close ChatGPT Desktop, restore your previous Codex config, and stop the proxy. On Windows, Relay first requests a graceful close and then force-quits a stuck tray/background process if necessary; config restoration waits until the Desktop process has actually exited. If ChatGPT was already running, the restart prompt is expected because the app must reload the temporary Relay configuration.
+
+Relay does not launch ChatGPT until the provider catalog resolves, the proxy is
+listening, its health and model catalog pass validation, and the temporary
+`config.toml` patch has been written and read back successfully. On macOS it
+targets the `com.openai.codex` bundle directly and verifies that the prior main
+process actually exited; closing only the visible Electron window is not
+treated as a restart.
+
+**Platforms:** macOS, Windows, and Linux. On Linux, Relay detects the packaged ChatGPT app at `/usr/bin/chatgpt` or `/usr/lib/chatgpt/ChatGPT` and its embedded Codex runtime at `/usr/lib/chatgpt/resources/codex`.
+
+### Linux and RDP
+
+Relay launches the Linux desktop executable directly instead of delegating to the desktop launcher. When the terminal is running inside X11 or an RDP session, Relay checks the terminal's `WINDOWID` and `WM_CLASS` across available X servers and passes the matching `DISPLAY` to ChatGPT. This handles desktop environments where the inherited `DISPLAY` points at a different graphical session.
+
+Linux desktop launches also restart an existing ChatGPT process when necessary so the temporary Relay configuration is actually loaded, including when the old Electron process is minimized to the tray. Keep the Relay terminal open for the lifetime of the session.
+
+### relay-ai flags
+
+| Flag | Purpose |
+|------|---------|
+| *(none)* | Interactive launch + open app |
+| `--restore` | Restore `config.toml` and remove relay-ai app files |
+| `--config` | **Preview only** — print TOML that would be written; no disk writes, no app, no proxy |
+| `--help` | Help text |
+
+**`--config` note:** Skips the picker. When `--provider` and `--model` are
+supplied, the preview uses that exact selection; otherwise it uses your last
+Codex provider/model from prefs (or the first compatible provider). The proxy
+port shown (`54321`) is a **placeholder**; a real launch uses a random port.
+
+### Files relay-ai owns (App)
+
+| File | Purpose |
+|------|---------|
+| `~/.codex/config.toml` | **Patched while session is active** — restored on Ctrl+C or `--restore` |
+| `~/.relay-ai/codex/app-models-<provider>.json` | Model catalog (all routable models for that provider) |
+| `~/.relay-ai/codex/session-app.json` | App session lock |
+| `~/.relay-ai/codex/app-restore-state.json` | Snapshot of your pre-session root keys (for surgical restore) |
+| `~/.relay-ai/codex/backups/config.toml.*.bak` | Rotating file backups before each patch |
+| `~/.relay-ai/logs/codex-route-audit.jsonl` | Private (`0600`) metadata-only routing receipt for mixed mode; no prompts, headers, tools, tokens, or credentials |
+
+CLI files (`relay-ai-launch.config.toml`, `session.json`, `models-*.json`) are **separate**. Running CLI after app (or vice versa) should not break the other.
+
+### What gets written to `config.toml`
+
+Example:
+
+```toml
+model = "claude-sonnet-4-6"
+model_provider = "openai"
+openai_base_url = "http://127.0.0.1:<random-port>/v1"
+model_catalog_json = "/Users/you/.relay-ai/codex/app-models-anthropic.json"
+model_context_window = 1000000
+model_auto_compact_token_limit = 700000
+```
+
+`model_context_window` tells Codex the model's actual context limit. `model_auto_compact_token_limit` (set to 70% of the limit) tells Codex when to trigger auto-compaction, leaving enough headroom for the compaction request itself to succeed. Both fields are removed on restore.
+
+The app deliberately keeps `model_provider = "openai"` and redirects the built-in provider with `openai_base_url`. Codex records the provider on every local thread and filters its history by provider; using a separate custom provider would hide existing OpenAI/ChatGPT threads while a relay-ai session is active. No conversations are deleted.
+
+The catalog `display_name` uses human-readable labels (e.g. `Claude Haiku 4.5`).
+
+### Cleanup (App)
+
+| Situation | What to do |
+|-----------|--------------|
+| Normal end of session | **Ctrl+C** in the relay-ai terminal → ChatGPT Desktop closes, config restores, proxy stops |
+| Codex already running | relay-ai asks to **restart Codex** so new settings apply; you can decline and reopen manually |
+| Windows Desktop remains in the background after Ctrl+C | Relay waits for graceful shutdown, then force-quits the stuck process before restoring config |
+| Crash / killed terminal | Next launch auto-recovers when possible, or `relay-ai codex-app --restore` |
+| Live session still running | `--restore` refuses until you Ctrl+C the other terminal |
+
+Restoration is transaction-safe. If `config.toml` still matches the exact Relay
+patch, Relay restores the verified backup byte-for-byte. If ChatGPT or the user
+changed unrelated settings during the session, Relay removes only its owned
+overlay keys and preserves those concurrent edits. Writes are atomic and retain
+private file permissions.
+
+For an unattended `--yes` session, `SIGTERM` or `SIGHUP` restores the config,
+stops the proxy, and quits ChatGPT so the app is never left pointing at a dead
+local provider. On Windows, shutdown escalates to a force-quit if the graceful
+close leaves a background process alive. A hard crash cannot run cleanup; once the Relay process
+is confirmed absent, recover with:
+
+```bash
+relay-ai codex-app --restore
+```
+
+Do not delete `config.toml`, the session lock, or the backup directory manually.
+If ChatGPT is configured as a login item, it can start independently after a
+login; keep it closed until a foreground Relay launch reports ready. A login
+agent should start Relay first and let Relay launch ChatGPT only after readiness,
+rather than starting both independently.
+
+### Verifying the real route
+
+Picker labels and model self-identification are not routing proof. Mixed-mode
+launches reset and append to `~/.relay-ai/logs/codex-route-audit.jsonl`. Each
+JSONL row records only the time, transport, requested model, native-vs-Relay
+dispatch, provider/upstream model, and outcome. Use its `complete` rows to prove
+that a native request reached OpenAI's native route or an external request
+reached the selected Relay provider. Full `--trace` is unnecessary for normal
+operation.
+
+### App vs CLI — config safety
+
+| | CLI | App |
+|--|-----|-----|
+| Touches `~/.codex/config.toml`? | **Never** | Yes, with backup + restore |
+| Proxy lifetime | Until Codex CLI exits | Until **Ctrl+C** in relay-ai terminal |
+| Picker every launch? | Yes (prefs pre-highlight last choice) | Yes |
+
+---
+
+## Favorites catalog mode
+
+When you have saved favorites via `relay-ai models`, both `relay-ai codex` and `relay-ai codex-app` will show your starting model + favorites in the mid-session model picker. Zen/Go favorites are included when an OpenCode API key is available.
+
+## Mixed native + Relay mode
+
+Build the independent Codex SubAgents catalog before launch:
+
+```bash
+relay-ai subagents
+```
+
+It starts empty and never imports or synchronizes with General Favorites. Choose exactly one Relay provider/model pair; Codex uses that model for every redirected SubAgent. Existing multi-model configurations keep their first entry when loaded.
+
+Opt into mixed mode explicitly:
+
+```bash
+relay-ai codex --with-native
+relay-ai codex-app --with-native
+```
+
+In the Relay web UI, enable **Load native Codex models alongside Relay models** on the Codex CLI or ChatGPT Desktop launch card. The choice applies to that launch only; the independent Codex SubAgents catalog remains saved separately.
+
+The selected Relay model remains the initial model. Native Codex models, General Favorites, and the configured Codex SubAgents model are entries in the mixed catalog. Codex decides when to launch a sub-agent; every child request marked by Codex is routed to the one configured Relay model regardless of the native model id inherited by the child. Because Codex's orchestration eligibility is tied to catalog metadata, the Codex SubAgents model may also be visible in the normal model picker. Relay starts one local capability-protected proxy for the session. Native HTTP and Responses-Lite WebSocket requests are forwarded to the authenticated Codex backend; Relay routes use the existing SDK translation path.
+
+Relay does not create custom Codex agent definitions. Codex owns agent roles and child settings; Relay owns only the selected provider/model route. Upgrades remove obsolete Relay-managed files named `relay-model-*.toml` while preserving every user-created agent file.
+
+Mixed mode fails closed if the configured Codex SubAgents model cannot be resolved from the current provider catalog or credential store. Relay reports the provider/model entry and does not launch with a partial catalog that would silently fall back to native sub-agents.
+
+When the Codex SubAgents model is configured, Relay probes the installed Codex runtime and enables `multi_agent_v2` for that launch. If the runtime cannot load that feature, Relay stops before launch with an upgrade message rather than starting a session whose Codex SubAgent route cannot work.
+
+Use `--relay-only` to force the existing Relay-only behavior. Mixed mode fails closed if the exact target Codex runtime cannot provide a valid native catalog, native forwarding, or safe collaboration-payload resolution.
+
+Relay does not decrypt native collaboration ciphertext. When a native parent delegates to a Codex SubAgent, Relay asks the authenticated native Codex backend to return the opaque envelope through a strict transport tool, validates the envelope boundary, and only then contacts the external provider. The same normalization runs before both HTTP and desktop WebSocket provider forwarding. This is transport validation, not independent cryptographic verification. Sensitive credentials, ciphertext, and collaboration content are redacted from Relay traces.
+
+### Slug policy
+
+- **CLI** (`relay-ai codex`): slugs are `${providerId}__${modelId}` so models from different providers never collide.
+- **App** (`relay-ai codex-app`): single-provider catalogs use bare model ids; favorites use the same `${providerId}__${modelId}` collision-safe form as the CLI.
+
+### Authentication
+
+For CLI favorites, the launched Codex child gets `OPENAI_API_KEY=proxy-local`, not your real upstream key. For the desktop app, Codex keeps its normal OpenAI login while `openai_base_url` points requests at the local proxy. In both cases, the proxy holds the real upstream credentials.
+
+### Reasoning effort
+
+The reasoning-effort slider in the Codex picker is shown only for models with a resolver-backed controllable reasoning profile. Resolution is declared-first: a family's verified ladder is combined with the levels the model declares on models.dev, then filtered down to levels that map to distinct wire values — a level that would be silently downgraded is dropped rather than sent as something weaker. OpenRouter additionally requires `reasoning` in the model's `supported_parameters`; generic `@ai-sdk/openai-compatible` routes offer the model's declared levels verbatim (that covers OpenCode Go/Zen, Nvidia, Venice, Command Code, and similar).
+
+### Proxy warm-up
+
+With many favorites (up to 50) spanning many providers, the first request after launch may be slow as the proxy initializes one `LanguageModel` per favorite. This is a known characteristic; subsequent requests are fast.
+
+---
+
+## Provider routing
+
+| Provider | CLI route | App route | Notes |
+|----------|-----------|-----------|-------|
+| **OpenAI API key** | Tier 1 direct | Local proxy | Add with `relay-ai providers add` |
+| **ChatGPT OAuth** | Tier 2 proxy | Local proxy | `relay-ai providers auth openai-oauth` |
+| **GitHub Copilot** | Tier 2 proxy | Local proxy | `relay-ai providers auth github-copilot`; plan-aware model catalog |
+| **ClinePass** | Tier 2 proxy | Local proxy | API key via `relay-ai providers add` or OAuth via `relay-ai providers auth cline-pass` |
+| **Anthropic, xAI, Gemini, Nvidia, DeepSeek, …** | Tier 2 proxy | Local proxy | SDK translation path |
+| **OpenCode Zen / Go** | Tier 2 proxy | Local proxy | Requires an OpenCode API key |
+
+Add providers with `relay-ai providers add` or import from OpenCode.
+
+---
+
+## OAuth
+
+Subscription tokens, including GitHub Copilot, xAI, ChatGPT OAuth, and ClinePass OAuth, refresh proactively and retry one upstream 401 in supported SDK routes. The retry is bounded to one attempt; if it fails, the session reports the provider error.
+
+---
+
+## Reasoning effort
+
+Codex exposes a **reasoning effort** picker when relay-ai's model catalog includes supported levels. relay-ai fills `supported_reasoning_levels`, `default_reasoning_level`, and `supports_reasoning_summaries` from the centralized reasoning resolver, which unions each provider family's verified ladder with the model's own models.dev declarations and keeps only levels that map to distinct wire values. `npm run test:reasoning` runs the coverage check against the bundled models.dev snapshot and fails when a declaring model is not offered its levels.
+
+**You control effort in Codex's native UI** — relay-ai does not add its own menu. For `relay-ai codex-app`, an existing `model_reasoning_effort` in `~/.codex/config.toml` is **preserved** (not deleted on launch).
+
+### Supported models (best-effort)
+
+| Provider npm | Example models | Picker levels | Wire mapping |
+|--------------|----------------|---------------|--------------|
+| `@ai-sdk/anthropic` | claude-opus-5, claude-sonnet-4-6 | per model: low/medium/high, plus `xhigh`/`max` where the model declares them | top-level `anthropic.effort` + adaptive thinking |
+| `@ai-sdk/openai` | gpt-5.5, gpt-6 | per model — the verified OpenAI table first, declared levels for newer models (up to `max`) | `reasoningEffort` on the Responses API |
+| `@ai-sdk/google` | gemini-2.5-pro, gemini-3.6-flash | per model: `minimal`/low/medium/high on Gemini 3-class models; low/medium/high on 2.5 | Gemini 3 → `thinkingLevel`; 2.5 → token budget |
+| `@ai-sdk/mistral` | mistral-medium-2604, magistral-* | high, none | `reasoningEffort: high \| none` |
+| `@ai-sdk/xai` | grok-4.5 … grok-4.7 | low/medium/high (plus `xhigh` on 4.6+) | `reasoningEffort` |
+| `@ai-sdk/groq`, `@ai-sdk/cerebras` | gpt-oss-120b, qwen3.8-27b | per model (declared) | `reasoningEffort` |
+| `@ai-sdk/perplexity` | sonar-deep-research | per model (declared: minimal..high) | `reasoning_effort` |
+| `@openrouter/ai-sdk-provider` | models with `reasoning` in `supported_parameters` | none..xhigh (declared `max` shows as XHigh) | `providerOptions.openrouter.reasoning.effort` |
+| `@ai-sdk/openai-compatible` | OpenCode Go/Zen, Nvidia, Venice, Command Code, … | per model (declared, verbatim) | `<providerId>: { reasoningEffort }` |
+| other packages (DeepInfra, Together, Cohere, Alibaba / Qwen Cloud, …) | — | *(picker hidden until a verified wire mapping exists)* | no effort sent |
+
+**Labels:** the top rung is shown as `xhigh` wherever the wire value is `max` (the Codex app drops `max`), and as `max` where that is the model's own declared value for a first-class API. Mistral only supports on/off — relay-ai shows `high` and `none`. Gemini 2.5 uses token budgets under the hood; the picker labels are low/medium/high for UX consistency.
+
+**Local providers:** Same heuristics apply. Unrecognized models (e.g. Ollama `llama3:8b`) get an empty picker — best-effort, no v1 guarantee.
+
+**Claude Code / Desktop gateway:** `relay-ai claude` and `relay-ai server` map Claude Code's `/effort` (`output_config.effort`) to the same SDK options. Anthropic direct passthrough routes forward effort unchanged.
+
+---
+
+## Out of ChatGPT usage? Keep working on Relay models
+
+When the ChatGPT account signed in to the Codex app reaches its usage limit, the app shows **"You're out of Codex and Work usage"** and disables Send for **every** model — including Relay models, which don't use ChatGPT usage at all. The check runs inside the app against the signed-in ChatGPT account, so Relay cannot lift it while that account is signed in. Switching to Relay-only mode alone is not enough.
+
+Your conversations are stored on your computer, so after either workaround you can reopen the stuck conversation, pick a Relay model, and continue.
+
+**Option A — sign in with an API key (no ChatGPT account):**
+
+1. Quit the app and run `relay-ai codex-app --relay-only`.
+2. In the app, log out (Settings → Account → Log out).
+3. At the sign-in screen choose **API key** and enter any character — Relay handles authentication.
+4. When you're done, sign back in with your ChatGPT account for normal use.
+
+Features that need a ChatGPT account — voice / speech-to-text, remote control, cloud tasks, the usage page — are unavailable while signed in with an API key.
+
+**Option B — sign in with another ChatGPT account that still has usage:**
+
+Use `relay-ai codex-app --relay-only` and sign in with any other ChatGPT account you own that has usage left; a free account works (free accounts include limited monthly usage). Relay models don't use that account's usage, so the block doesn't return, and account features stay available as far as that account's plan includes them. Use Relay-only mode for this: in mixed mode, native GPT models would spend that account's small allowance quickly.
+
+> OpenAI's terms prohibit circumventing usage limits. Relay models don't consume OpenAI usage, but decide for yourself whether switching accounts fits your situation.
+
+## Troubleshooting
+
+### CLI (`relay-ai codex`)
+
+| Symptom | Fix |
+|---------|-----|
+| Provider missing in picker | `relay-ai providers add` |
+| Leftover files after crash | Next launch auto-cleans, or `relay-ai codex --restore` |
+| “Another session running” | Wait or `--restore` |
+| Shell tools have no network | Should be default; confirm with `relay-ai codex --config` (profile has `sandbox = "danger-full-access"`) or pass `-s danger-full-access` |
+| Read-only / CI behavior | relay-ai strips CI vars; try Terminal.app outside IDE |
+| `codex` not found | `npm install -g @openai/codex` |
+
+### App (`relay-ai codex-app`)
+
+| Symptom | Fix |
+|---------|-----|
+| Existing conversations disappear during a relay-ai session | Update relay-ai. Older releases selected a custom `model_provider`, so Codex filtered the sidebar to relay-ai-only threads. Current releases keep the built-in `openai` provider and preserve normal history visibility. |
+| "You're out of Codex and Work usage" and Send is disabled, even on a Relay model | The app blocks every model when the signed-in ChatGPT account is out of usage. See [Out of ChatGPT usage?](#out-of-chatgpt-usage-keep-working-on-relay-models) |
+| App didn’t open | Open Codex manually once, run `relay-ai codex-app` again |
+| Model errors / disconnected | Keep relay-ai terminal open (proxy must run). On Codex App/ChatGPT Desktop, update to relay-ai 0.11.1 or newer; it fixes WebSocket framing that could cause valid requests to be dropped and trigger reconnects. |
+| Models appear but requests do not answer | Confirm the foreground Relay process is still running. Picker presence alone does not prove the proxy is alive; recover with `relay-ai codex-app --restore` only after the Relay process is confirmed absent. |
+| Stuck on relay-ai settings | `relay-ai codex-app --restore` |
+| `--restore` blocked | Ctrl+C the other relay-ai codex-app terminal first |
+| Ctrl+C says ChatGPT Desktop did not exit | Update to relay-ai 0.11.1 or newer and try again. On Windows, Relay now force-quits a stuck background Desktop process before restoring config. If it still cannot exit, close ChatGPT in Task Manager, then run `relay-ai codex-app --restore`. |
+| Windows shows a Node/libuv assertion after `--restore` or `--help` | Update to relay-ai 0.11.1 or newer. Recovery and help commands no longer start the background model-catalog refresh that could keep a Windows network handle alive during process shutdown. |
+| Wrong config after test | `--restore`; backups in `~/.relay-ai/codex/backups/` |
+| "prompt too long" / session crashes after many turns | The conversation history grew past the model’s context limit. Start a fresh conversation in Codex. relay-ai now sets `model_auto_compact_token_limit` in config.toml to prevent this going forward — see [Context management](#context-management-and-session-architecture). |
+| Trying to continue a large GPT-5.5 session on a different model | Codex sends the full conversation history inline; 1 M-token models reject 2 M-token payloads. relay-ai trims the oldest messages automatically, but some early context will be lost. Starting fresh is the cleanest option. |
+| Model shows as "Custom" in the Codex UI | Expected — Codex labels all external catalog models as "Custom". The correct model is in use. |
+| Need to prove which provider answered | Inspect `~/.relay-ai/logs/codex-route-audit.jsonl`; use `complete` rows, not the model's self-identification. |
+| External model ignores an attached image | Update to relay-ai 0.11.1 or newer. Relay now forwards Responses `input_image` parts, but the selected provider/model must support vision. |
+| Provider reports that no endpoint supports image input | The selected provider/model does not advertise a vision-capable endpoint for this request. Relay now forwards the provider failure as a visible Codex error; choose a vision-capable model or remove the image. |
+
+### Shared
+
+| Symptom | Fix |
+|---------|-----|
+| Anthropic key rejected on `providers add` | Update relay-ai (Bearer vs `x-api-key` fix) |
+| Model says relay-ai forced sandbox | Wrong — check Codex sandbox flags, not `RELAY_AI_CODEX_KEY` |
+| MCP tools (Context7, chrome-devtools, the built-in browser) fail with `unsupported call: ...` | Update relay-ai — fixed by translating Codex's proprietary namespace-wrapped tool format on both request and response. |
+| Image generation (`image_gen`) fails, e.g. `404 Not Found` on `/v1/images/generations` | **Known limitation, no workaround.** `image_gen` calls an OpenAI image backend relay-ai doesn't implement, and most registry models can't generate images regardless. Works normally with Codex's native OpenAI/ChatGPT models. |
+| `Fatal error: remote compaction v2 expected exactly one compaction output item` | Update relay-ai — fixed by synthesizing the single `compaction` output item Codex's v2 compaction parser requires (previously the proxy replied with a normal message, which Codex rejected outright). |
+
+---
+
+## Context management and session architecture
+
+### How Codex handles conversation history
+
+Codex App is a **stateless client**: it sends the full accumulated conversation history with every single request to the proxy. There is no server-side reference system in use — the `previous_response_id` field in the Responses API spec is not implemented in the Codex App binary. Every turn sends all prior turns.
+
+This means:
+
+- Each request grows larger as the conversation continues (~one new message pair per turn).
+- A session that ran for hundreds of turns with GPT-5.5 (which OpenAI manages server-side on their infrastructure) cannot be resumed transparently on a different model via relay-ai — the full local history is sent inline, and 1 M-token models will reject a 2 M-token payload.
+- relay-ai has no way to make Codex adopt a different history-referencing approach. This is a fixed architectural property of the Codex App.
+
+### How relay-ai protects against context overflow
+
+relay-ai uses three complementary layers (App only for the first; all three apply to the proxy itself, which both the CLI and the app share):
+
+**1. Early auto-compaction via config.toml (App only)**
+
+At session start, relay-ai writes two fields into `~/.codex/config.toml`:
+
+```toml
+model_context_window = 1000000          # the model's actual limit
+model_auto_compact_token_limit = 900000  # 90% of the limit
+```
+
+Codex reads `model_auto_compact_token_limit` and triggers its built-in compaction before the conversation reaches that threshold. The ratio is intentionally high (90%, not a tighter figure) — a single large tool result (e.g. a browser snapshot can be ~1 MB / ~300K tokens) must not trip auto-compaction after only a couple of turns. Without these fields, Codex either never compacts (for unknown models) or compacts too late, causing the compaction request itself to exceed the model limit. The CLI (`relay-ai codex`) does not write these fields — it launches a temporary sidecar profile rather than patching your `config.toml` — so auto-compact timing there follows the `codex` binary's own defaults or your existing config.
+
+**2. Remote compaction v2 support**
+
+When Codex does trigger compaction, it sends a `{"type":"compaction_trigger"}` request and requires the response to contain **exactly one** output item of type `compaction`, or it fails with `Fatal error: remote compaction v2 expected exactly one compaction output item, got N from M`. relay-ai detects this trigger, asks the model for a plain-text summary, and returns it wrapped as the single `compaction` item Codex expects — then decodes that item back into readable context on later turns, so compaction succeeds instead of crashing the session. This applies to both `relay-ai codex` and `relay-ai codex-app`/`relay-ai chatgpt`.
+
+**3. Proxy-level truncation as a last resort**
+
+If a conversation that already exceeds the safety threshold arrives at the proxy (e.g. after switching from a GPT-5.5 session to a 1 M-limit model mid-way through), relay-ai drops the oldest messages before forwarding — enough to bring the estimated token count below 85% of the model's context window. The session continues in a degraded but functional state rather than crashing.
+
+### "Custom" label in the Codex App model picker
+
+When relay-ai configures Codex to use an external model via `model_catalog_json` and a custom `openai_base_url`, Codex App displays the model with a **"Custom"** label in the UI (e.g. "Custom · Medium"). This is expected Codex App behavior for any model loaded from a catalog that isn't in Codex's built-in provider list. The actual model relay-ai selected is in use — the label is cosmetic.
+
+### Background GPT requests from Codex's internal agent
+
+Codex App has an internal agent subsystem that periodically sends background requests using hardcoded OpenAI model IDs (`gpt-5.4`, `gpt-5.4-mini`, `gpt-5.5`), regardless of what model is configured. relay-ai's proxy silently routes these to the session's starting model. This is intentional — the background agent handles UI state tasks and does not affect your conversation.
+
+---
+
+## See also
+
+- [Codex advanced config](https://developers.openai.com/codex/config-advanced)
+- [Codex agent approvals & security](https://developers.openai.com/codex/agent-approvals-security)
+- [README — Codex sections](../README.md)
+- `relay-ai codex --help` · `relay-ai codex-app --help`

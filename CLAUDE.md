@@ -1,0 +1,241 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Note that the codebase supports Claude Code, OpenAI Codex, and Google Gemini CLI.
+
+**Docker / always-on gateway:** If a user asks to run Relay AI in a container, follow **[docs/DOCKER.md](docs/DOCKER.md)** (AI checklist + questions). That deploys Server + Admin UI only — not desktop app launch.
+
+**Runtime — bun only (Termux/Android build):** This vendored build targets Termux/Android. Run everything with **bun** (`bun run …`) — not npm, not node. `engines` pins `bun >=1.4`. Secrets go straight to the **passage** CLI (installed via `pkg install passage` — an APT/pkg package, **not** npm), because Termux has no OS keychain / Secret Service daemon. Termux also ships bionic-native tools that don't exist on npm (e.g. **biome 2** at `$PREFIX/bin/biome`) — use them directly from `$PREFIX/bin`; never substitute an npm lookalike.
+
+## Release workflow
+
+Publishing is automated by GitHub Actions (`.github/workflows/publish.yml`): **pushing a `v*` tag** runs typecheck + tests + build, then `npm publish` (auth via the `RELAYAI` repo secret — an npm Automation token) and creates a GitHub Release from the matching `CHANGELOG.md` section. **Do NOT run `npm publish` locally** — that double-publishes and fails.
+
+To release a new version:
+
+```bash
+# 1. Land all code changes and a CHANGELOG.md "## [x.y.z]" section first (committed).
+npm run refresh:models-dev               # refresh bundled models.dev snapshot (keeps reasoning-effort metadata current)
+npm version patch --no-git-tag-version   # bump package.json + package-lock (use minor/major as needed)
+npm run build                            # rebuild dist — VERSION is derived from package.json automatically
+git add -A && git commit -m "release: vX.Y.Z"
+git tag -a vX.Y.Z -m "vX.Y.Z"            # MUST be annotated (-a); see below
+git push --follow-tags                   # tag push triggers CI → npm publish + GitHub Release
+```
+
+**The tag must be annotated (`git tag -a`).** `git push --follow-tags` pushes only annotated tags, so a lightweight `git tag vX.Y.Z` is silently left behind: the push reports `main -> main`, no `v*` ref reaches the remote, and the publish workflow never triggers. The release looks committed but nothing is published. If that happens, `git tag -d vX.Y.Z && git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z` recovers it. Verify with `git ls-remote --tags origin | grep vX.Y.Z` — an annotated tag shows both `refs/tags/vX.Y.Z` and `refs/tags/vX.Y.Z^{}`.
+
+`package.json` is the single source of truth for the version. Never edit `src/constants.ts` manually for version bumps. `dist/` is committed, so rebuild it in the release commit.
+
+**Every version display must derive from `package.json`, never a hardcoded string.** `src/constants.ts::VERSION` reads `pkg.version`; `relay-ai ui`'s sidebar (`src/ui/public/index.html`'s `v{{VERSION}}` placeholder) is substituted at server-start by `buildStaticCache()` in `src/ui-command.ts` using that same `VERSION` constant. Both update automatically on `npm run build` — no manual edit needed. If you add a new version display anywhere (CLI banner, UI, docs generator), wire it to `VERSION`/`pkg.version` rather than hardcoding a string, or it will go stale on the next release (this happened once: the UI sidebar showed `v0.4.0` while `package.json` was already at `0.4.1`).
+
+## Commands
+
+```bash
+bun run build       # compile TypeScript → dist/cli.js (via tsup, ESM, shebang injected)
+bun run test        # run all tests with vitest
+bun run typecheck   # type-check without emitting (tsc --noEmit)
+bun run dev         # watch mode build
+
+# Run a single test file
+bunx vitest run tests/env.test.ts
+bunx vitest run tests/models.test.ts
+
+# Test the CLI locally (bun runtime — no npm/node; `bun link` first if not linked)
+bun dist/cli.js --help
+bun dist/cli.js models          # manage favorite models for mid-session switching
+bun dist/cli.js claude --dry-run   # simulate full first-run without writing anything
+bun dist/cli.js claude --setup    # re-ask subscription tier
+bun dist/cli.js claude --trace    # write debug log to $TMPDIR/relay-ai-debug.log and print errors on exit
+bun dist/cli.js server           # foreground OpenCode/registry API gateway
+bun dist/cli.js server --vertex  # foreground Vertex AI gateway (gcloud ADC)
+bun dist/cli.js codex            # Codex CLI with registry providers (see docs/CODEX.md)
+bun dist/cli.js codex-app        # Codex desktop app (macOS/Windows/Linux; see docs/CODEX.md)
+bun dist/cli.js gemini           # Gemini CLI with registry providers
+
+# Rebuild after code changes before testing manually
+bun run build && bun dist/cli.js --version
+```
+
+## Architecture
+
+**Entry point:** `src/cli.ts` orchestrates the full flow. Every other module is a focused unit with no side effects at import time.
+
+**Data flow (`relay-ai claude`):**
+```
+cli.ts
+  → findClaudeBinary()         [launch.ts — locate claude binary]
+  → fetchLocalProviders()      [providers.ts — ephemeral opencode serve, GET /config/providers, normalize]
+  → p.select "Which provider?" [shown when local providers are available]
+
+  ── OpenCode cloud path (default) ──
+  → resolveOrCollectApiKey()   [reads env, OS credential store (all platforms), or prompts user]
+  → askSubscriptionTier()      [prompts.ts — one-time question, saved to conf store]
+  → getModels()                [models.ts — API fetch + cache enrichment + format classification]
+  → runWizard()                [prompts.ts — backend/model selector, filters unsupported]
+
+  ── Local provider path ──
+  → pickLocalModel()           [prompts.ts — filter/select model from local provider]
+
+  ── Shared launch (no favorites) ──
+  → startProxy()               [proxy.ts — single-model wrapper around startProxyCatalog]
+  → buildChildEnv(baseUrl, …)  [env.ts — removes 17 conflicting vars, sets OpenCode vars]
+  → launchClaude()             [launch.ts — spawn with stdio:inherit]
+  → proxyHandle.close()        [stops proxy after Claude exits]
+
+  ── Switch-menu launch (favorites.length > 0) ──
+  → buildCatalogRoutes()       [catalog.ts — starting model + favorites, max 50]
+  → startProxyCatalog()        [proxy.ts — multi-route proxy, alias IDs per model]
+  → buildChildEnv(…, gatewayDiscovery=true)  [sets CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1]
+  → launchClaudeViaCatalog()   [cli.ts — shared launch + trace cleanup]
+```
+
+**`relay-ai models`:** Interactive favorites manager (`src/favorites.ts`). Reads/writes `favoriteModels` in config. Saves once on Done. Stale favorites (unavailable models) are silently skipped when building the catalog.
+
+**Catalog routing** (`src/catalog.ts`): `localModelToRoute`, `makeRouteResolver`, `buildCatalogRoutes`. Routes built only for starting model + favorites — not the full model list. Zen/Go models route through the same `localModelToRoute` path as all registry providers. Alias IDs via `aliasModelId()` in proxy so Claude Code sees unique model names in `/model`.
+
+**Critical URL constraint:** `BACKENDS.baseUrl` in `constants.ts` must NOT include `/v1`. The Anthropic SDK appends `/v1/messages` automatically. Setting it to `https://opencode.ai/zen/v1` would cause requests to hit `/zen/v1/v1/messages` → 404.
+
+**Model discovery two-source merge:**
+- Primary: `GET {backendUrl}/v1/models` (no auth needed, returns available IDs)
+- Enrichment: `~/.cache/opencode/models.json` (written by OpenCode CLI) — provides `name`, `family`, `cost`, `provider.npm`
+- `isAnthropicNative`: true when `modelFormat === 'anthropic'`
+- `modelFormat`: classified from `provider.npm` in cache, or by ID-prefix heuristic:
+  - `@ai-sdk/anthropic` or `claude-*` → `'anthropic'` (direct passthrough)
+  - `@ai-sdk/openai` or `gpt-*` → `'unsupported'` in the **cloud OpenCode wizard** (OpenCode Zen/Go proxy layer; not direct OpenAI). Use the **local OpenAI provider** instead for GPT models.
+  - `@ai-sdk/google` or `gemini-*` → `'unsupported'` (needs model-specific endpoints)
+  - Everything else → `'openai'` (routed through the SDK adapter via the local proxy)
+- `sourceBackend`: set from the backend that was queried — critical for `go` tier which shows Zen free models + Go paid models in one list, so the correct `ANTHROPIC_BASE_URL` can be set per selected model
+
+**Translation layer — the Vercel AI SDK adapter** (`src/sdk-adapter.ts` + `src/provider-factory.ts`): All non-Anthropic providers route through the Vercel AI SDK (`ai` + `@ai-sdk/*`, the same packages OpenCode loads), which owns wire format, endpoint selection, and provider quirks. This is the **single** translation path — there is no hand-rolled per-provider translation.
+
+- **`provider-factory.ts`** — `createLanguageModel({ npm, modelId, apiKey, baseURL })` (async) maps whatever `api.npm` OpenCode assigns to an SDK `LanguageModel` via dynamic `import(npm)` + `create*` factory discovery. Special branches for OpenAI/xAI Responses API selection and openai-compatible/openrouter base URLs. `isSdkMigratedNpm(npm)` is true for any npm except `@ai-sdk/anthropic`. `modelPrefersResponsesApi(modelId)` selects `provider.responses(id)` over `provider.chat(id)` for OpenAI/xAI models that require the Responses API (GPT-5.4+, GPT-5.5, `*-codex`, o-series, xAI `*-multi-agent`). OpenCode's bundled SDK provider packages ship as npm `dependencies` (externalized in tsup, loaded on demand).
+- **`sdk-adapter.ts`** — Anthropic `/v1/messages` ↔ SDK, one turn per request (Claude Code owns the tool loop). `translateRequest(body, npm)` builds the SDK call params (messages, tools, tool_choice, system) and folds inline `role:'system'` messages — Claude Code injects the skills list / system-reminders this way — into the system prompt so they aren't dropped. `streamAnthropicResponse` maps the SDK `fullStream` to Anthropic SSE; `generateAnthropicResponse` handles non-streaming. `thought_signature` round-trips: encoded into the Anthropic `tool_use.id` as `{id}::ts::{signature}` and decoded back into `providerOptions.google.thoughtSignature` (Gemini puts the signature on the tool-call parts, captured at `tool-input-start`). The SDK handles Gemini's strict `thought_signature` echo-back correctly — the reason a hand-rolled Gemini-native path used to be required.
+
+**Local proxy** (`src/proxy.ts`): a local HTTP server on `127.0.0.1:<random-port>` that accepts Anthropic-format requests at `/v1/messages` and dispatches per route (`startProxyCatalog`/`startProxy`): `modelFormat === 'anthropic'` → direct passthrough to the provider's Anthropic endpoint; otherwise → `isSdkMigratedNpm(route.npm)` → the SDK adapter. Each `ProxyRoute` carries `npm` + `baseURL`. `GET /v1/models` returns a synthetic catalog including `context_window` per model (via `formatAnthropicModelEntry` / `resolveContextWindow`) so Claude Code's status bar shows accurate remaining context. `aliasModelId()` rewrites non-`claude-*` ids to `anthropic-{provider}__{id}` so gateway model discovery accepts them. **Exception:** a provider id starting with `custom-` also gets its `claude-*` ids rewritten. Custom backends can be added repeatedly against one upstream (two accounts on one gateway), so their `claude-*` ids are not unique across providers; leaving them bare made `buildCatalogRoutes` drop the second as a duplicate and collide the proxy's `byAlias` map, silently routing one account's requests through the other's credential.
+
+**HTTP MITM proxy (`src/http-proxy/`)** — the transparent-mode alternative to the local `proxy.ts` server above, used when Claude Code should keep its native Anthropic subscription/OAuth login while also getting Relay favorites in the `/model` picker. `startHttpProxy()` (`server.ts`) runs a local forward-proxy (`HTTPS_PROXY`/`HTTP_PROXY`) plus a MITM HTTPS server backed by a per-session self-signed CA (`ca.ts`, cleaned up on exit). `buildHttpProxyChildEnv()` (`env.ts`) points the child's `ANTHROPIC_BASE_URL` at a **sentinel host**, `RELAY_SENTINEL_HOST` (`anthropic-host.ts`) — not the real `api.anthropic.com` — while the proxy still intercepts CONNECTs to that sentinel and forwards to real Anthropic underneath. `favorites.length > 0` in this mode still constructs `ProxyRoute`s (`routes.ts`) and adapts them via the same `startProxyCatalog` local-adapter path as `proxy.ts`.
+
+- **Why the sentinel host, not `api.anthropic.com`:** Claude Code's `/model` picker only reads its seeded gateway-discovery models cache (`~/.claude/cache/gateway-models.json`, written by `writeGatewayDiscoveryCache()` in `discovery-cache.ts`) when `ANTHROPIC_BASE_URL`'s host is **not** `api.anthropic.com` (verified by decompiling Claude Code 2.1.220 — the picker's gate calls a helper that special-cases the real hostname off). Seeding the cache while the base URL is the real hostname is silently ignored; only the launch model appears. Subscription/OAuth auth is unaffected by this — it's gated by a separate check that only cares about Bedrock/Vertex/gateway env flags, not the base-URL host — so the sentinel host gets favorites into the picker with zero auth impact.
+- **Host-header + billing-header restoration:** because the child now dials the sentinel host, its outbound `Host` header and Claude Code's own `x-anthropic-billing-header` (which only appends a `cch=00000;` attribution segment when it thinks it's talking to `api.anthropic.com` directly) both reflect the sentinel. `forwardRawRequest`/`fetchUpstreamModelsList` in `server.ts` rewrite the `Host` header back to `ANTHROPIC_UPSTREAM_HOST` and re-inject the missing `cch=00000;` segment before forwarding, so real Anthropic sees a byte-identical request to what it always received.
+- The self-signed cert's CN/SAN (`ca.ts`) is set to `RELAY_SENTINEL_HOST`, matching what the child now dials.
+
+**Subscription tiers** control which models are shown and whether a backend selector appears:
+- `free` / `zen`: always Zen backend, no backend selector
+- `go`: Go backend, but also fetches Zen for free models — combined list, backend inferred from `sourceBackend` of selected model
+- `both`: shows backend selector
+
+**Env isolation:** `buildChildEnv()` copies `process.env`, deletes all 17 vars in `CONFLICTING_ENV_VARS`, then sets `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`. `launchClaude()` also passes `--model`. Isolation applies to the child process only — the parent shell is not mutated (except `OPENCODE_API_KEY` during key setup). Claude Code may persist the model to `~/.claude/settings.json` independently; that is outside relay-ai's control.
+
+**Preferences** (at `~/.relay-ai/config.json`, migrated from legacy `conf` path on first read): `lastBackend`, `lastModel`, `lastProvider`, `recentModelsByProvider`, `favoriteModels`, `subscriptionTier`, and a 1-hour model list cache. Override path with `RELAY_AI_HOME`. All writes are skipped when `dryRun === true`.
+
+**API key storage** uses `@napi-rs/keyring` (installed as `optionalDependencies`) for cross-platform credential store access. The module is loaded via dynamic `import()` so a missing native binary degrades gracefully. `tsup.config.ts` marks `@napi-rs/keyring` and all `@ai-sdk/*` provider packages as `external` so they resolve from `node_modules` at runtime (keeps `dist/cli.js` small).
+
+On startup, `resolveOrCollectApiKey()` silently calls `readFromCredentialStore()` — if a key is found the prompt is skipped entirely.
+
+Save options per platform:
+- **macOS** (4 options): Keychain only | Keychain + `~/.zshrc` auto-load | shell profile (plaintext) | session only
+  - The `~/.zshrc` auto-load line uses the `security` CLI directly (so the shell can source it): `export OPENCODE_API_KEY="$(security find-generic-password -s relay-ai -a relay-ai -w 2>/dev/null)"`
+- **Windows** (3 options): Windows Credential Manager | `setx` user env var (plaintext) | session only
+  - `setx` is called with `stdio: ['pipe','pipe','pipe']` to suppress its "SUCCESS" stdout
+- **Linux desktop** (3 options): Secret Service (GNOME Keyring / KWallet) | shell profile (plaintext) | session only
+  - Secret Service availability is probed via a test `getPassword()` call — returns false if the daemon isn't running
+- **Linux headless** (2 options): shell profile | session only — shown with a `p.log.info` note explaining why secure storage is unavailable
+
+In all cases `process.env['OPENCODE_API_KEY']` is set immediately so the key is active for the current session regardless of save choice.
+
+**Local provider discovery** (`src/providers.ts`): `fetchLocalProviders()` spawns `opencode serve --port 0`, waits for the listening URL in stdout/stderr (10s timeout, spinner shown in CLI), fetches `GET /config/providers`, then kills the process. `normalizeProviders()` (called internally) skips OAuth providers (empty key), skips `opencode`/`opencode-go` (cloud backends handled separately), and classifies each model via `resolveEndpoint(npm, apiUrl)`: `@ai-sdk/anthropic` → passthrough; `@ai-sdk/openai-compatible` without `api.url` → skip; any other non-empty `api.npm` → SDK adapter (`format: 'openai'`). OpenCode is the source of truth for which providers/models appear — relay-ai does not maintain a per-package allowlist. Each model captures `api.npm`, `api.url` (`apiBaseUrl`), and `api.id` (`upstreamModelId` for SDK/upstream calls; catalog `id` stays for Claude Code's picker). Cost display in Claude Code is inaccurate for non-Anthropic models (Claude Code applies its own pricing table); documented limitation.
+
+**Local provider routing:** Two paths depending on `model.modelFormat`:
+- `'anthropic'`: `buildChildEnv(model.baseUrl, model.id, provider.apiKey)` — no proxy, Claude Code talks directly to the provider's Anthropic-compatible endpoint. The `baseUrl` must NOT include `/v1` (the Anthropic SDK appends it).
+- `'openai'`: `startProxy(model.completionsUrl ?? '', model.id, trace, contextWindow, { npm, baseURL, upstreamModelId })` — SDK adapter proxy on a random local port; `buildChildEnv('http://127.0.0.1', model.id, provider.apiKey, proxyPort)`. The route's `npm` selects the SDK provider via dynamic import; `baseURL` (`api.url`) is used for openai-compatible / openrouter providers. `completionsUrl` is optional for SDK-first-party packages (SDK owns endpoints).
+
+**Providers that need a non-empty API key:** `normalizeProviders` skips any provider with an empty `key` field (to filter OAuth-only providers like OpenAI/xAI configured via browser login). Local providers that don't validate keys (e.g. Ollama) must still have a non-empty placeholder key set in OpenCode (e.g. `"ollama"`).
+
+**Server command local providers** (`src/server/index.ts`): `loadServerModels()` calls `fetchProviderCatalog()` which loads all registry providers (including Zen/Go) via `loadRegistryProviders()`, then converts them with `localProvidersToServerModels()`. The router (`src/server/router.ts`) `handleAnthropicMessages`: anthropic-format → forward raw to `{baseUrl}/v1/messages`; openai-format → `isSdkMigratedNpm(npm)` guard → `createLanguageModel` + `streamAnthropicResponse`/`generateAnthropicResponse` (same SDK adapter as the CLI proxy). `GET /models` strips `apiKey` from output. Spinner shows `"N models (M from local providers)"`.
+
+**Stale free models:** `STALE_FREE_MODELS` in `constants.ts` contains models whose free promotion ended but the API still returns them. Currently only `qwen3.6-plus-free`. These are filtered out in `mergeModels()`.
+
+**Recent models per provider** (`src/prompts.ts`, `src/cli.ts`, `src/types.ts`, `src/config.ts`): `UserPreferences.recentModelsByProvider: Record<string, string[]>` stores up to 3 recently used model IDs per provider. `pickLocalModel()` shows them at the top of the picker with a `'recent'` hint, plus a "Browse all models →" option. On launch, `cli.ts` prepends the selected model id and saves back (deduped, max 3). Skipped on `--dry-run`.
+
+**Large catalog UX** (`src/prompts.ts`): `MODEL_SEARCH_THRESHOLD = 25` — lists above this show search or paginated browse. `MODEL_PAGE_SIZE = 15` — prev/next pagination. `selectModelWithSearch`, `selectLargeCatalog`, `pickModelFromPagedList`.
+
+**Shared upstream forwarding** (`src/upstream-forward.ts`): `relayAnthropicMessages` + `anthropicUpstreamHeaders` are the single Anthropic-passthrough path for both `proxy.ts` and `server/router.ts` — both call sites now get the same treatment: `route.headers`/`model.headers` forwarded as `extraHeaders` (spread before the built-in Authorization/x-api-key headers so they can't override them), and an optional `refreshToken` callback retried once on a 401.
+
+**Provider catalog helpers** (`src/provider-catalog.ts`): `fetchProviderCatalog`, `providersForPicker`, `localProvidersToServerModels` — shared between CLI and server. Zen/Go are handled as regular registry providers; no special-case functions needed.
+
+**Command Code** (`src/registry/fetch-commandcode-models.ts`, `modelSource: 'commandcode'`): the only provider whose models carry **mixed wire protocols under one entry**. Command Code accepts `claude-*` only on `/messages` (Anthropic schema) and everything else only on `/chat/completions` (OpenAI schema); calling the wrong one is a hard provider error. The route is pinned per model via `CachedModel.npm`/`apiUrl`, which `materialize.ts` prefers over `provider.api.npm` (`cachedModelToLocal` reads `cached.npm ?? provider.api.npm`). `resolveEndpoint('@ai-sdk/anthropic', '…/provider/v1')` strips the `/v1` so the Anthropic SDK re-appends `/v1/messages` — do not "fix" that base URL. This is why it is a builtin and not a custom endpoint: `customEndpointKind()` is one kind or the other.
+
+Availability is **probed per key**, not derived from the model id. Command Code gates models by plan without following model family (on GOAT `gpt-5.6-sol` works but `gpt-5.5` does not; `muse-spark-1.1` is a different tier from 1.2/1.3) and exposes no endpoint reporting the caller's plan — every account path 404s. `filterModelsByPlan()` sends one `max_tokens: 1` request per model at concurrency 6 (~23s for 69 models). `classifyProbeResponse()` drops a model **only** on an explicit `MODEL_NOT_IN_PLAN` 403; a 503 (Command Code's overloaded-upstream signal) and every other failure return `'unknown'` and keep it, and an all-probes-failed run falls back to the unfiltered list. An earlier prefix heuristic that marked only `claude-*` as Pro+ was wrong in both directions and was removed. Note Command Code reports streaming failures as HTTP 200 plus an in-stream chunk reading `Stream error occurred`, so an outage surfaces to users as that generic text, not as an HTTP status.
+
+**Custom endpoints** (`src/registry/custom-endpoint.ts`): `addCustomEndpointProvider` and `updateCustomEndpointProvider` share `fetchCustomEndpointModels()`, which branches to `fetchAnthropicModels` (`registry/fetch-anthropic-models.ts`) or `fetchTemplateModels`. Multiple instances of the same base URL are supported and are the intended way to run two accounts on one gateway — only an exact url + key + headers match is flagged (`duplicateOf`, overridden by `confirmDuplicate`). Edit is restricted to `custom-openai` / `custom-anthropic` (`customEndpointKind()`); provider ids never change on rename, so favorites keep resolving. A name-only edit makes no network call. Blank API key means keep the stored key; supplying `headers` replaces the whole set and `{}` removes all. Credential write precedes the registry write. `refresh-models.ts::refreshApiListProvider` must forward `provider.api.headers` to both fetchers — omitting them silently breaks any backend whose account is identified by a header. Custom backends also receive `allowInsecureLocal: true` on refresh matching add time, checked by `validateCustomEndpointUrl` (restricting HTTP to private/loopback IPs).
+
+**Tests** cover pure functions: `env.ts`, `models.ts`, `sdk-adapter.ts`, `provider-factory.ts`, `proxy.ts` (`aliasModelId`), `providers.ts`, `catalog.ts`, `favorites.ts`, `prompts.ts`, `upstream-forward.ts`, `config.ts`, `tool-search.ts`, `cli.ts` (help text), server modules, and UI API endpoints. Interactive launch flows, CLI prompts, and the browser UI (`src/ui/public/app.js`, which sits outside the TypeScript compilation unit) are verified manually.
+
+## Key constraints
+
+- `settings.json` is never touched by relay-ai. Launch config is env-var-only, passed to the child process (plus `--model`). This avoids the backup/restore problem that `ollama launch claude` has. **Caveat:** Claude Code itself persists the launched model to `~/.claude/settings.json`, so bare `claude` later may still show an relay-ai alias (e.g. `anthropic-opencode-go__deepseek-v4-flash`). Gateway discovery caches at `~/.claude/cache/gateway-models.json`. Reset with `claude --model sonnet` or by editing/removing those files.
+- `--dry-run` ignores all saved state (env key, Keychain, tier, preferences) and skips all writes. Used to simulate a fresh first-run experience.
+- When adding a new backend, update `BACKENDS` in `constants.ts`, the `BackendConfig` id union in `types.ts`, and the subscription tier logic in `prompts.ts` and `cli.ts`.
+- `buildChildEnv(baseUrl: string, model, apiKey, proxyPort?)` — takes a plain string URL, not a `BackendConfig`. When `proxyPort` is set, `ANTHROPIC_BASE_URL` is always `http://127.0.0.1:{proxyPort}` regardless of `baseUrl`.
+- `startProxy(completionsUrl, modelId, debug, contextWindow?, sdk?)` — single-model wrapper around `startProxyCatalog`; `sdk` carries `{ npm, baseURL }` to select the SDK provider.
+- `startProxyCatalog(routes, startingAliasId, debug)` — multi-route catalog proxy for switch-menu sessions.
+- `MAX_MODEL_CATALOG = 50` in `constants.ts` — favorites cap and max routes in catalog.
+- **Provider credential resolution is not centralized.** `src/provider-catalog.ts::resolveLocalProviderApiKey()` is the canonical helper (direct key → anonymous/`apiKeyOptional` providers like Kilo Code → registry authRef → OAuth keyring fallback) and is used by `cli.ts`, `gemini.ts`, and `antigravity/launch-routes.ts`. `codex.ts`, `codex-app.ts`, `claude-app.ts` (2 call sites), and `favorites-resolver.ts::resolveFavorite()` each have/had their own separate copy of similar logic that can drift from the shared helper (this is how the Kilo Code "No credential" bug shipped — the anonymous-provider fix landed in the shared helper but not in these four other call sites). When fixing a provider-credential bug, grep all of them — a fix to the shared helper alone will not propagate.
+
+**Codex favorites catalog:** When `prefs.favoriteModels.length > 0`, `relay-ai codex` and `relay-ai codex-app` enter favorites mode on launch:
+- Shared resolver (`src/favorites-resolver.ts`) resolves each favorite to a `{providerId, providerName, model, apiKey}` entry, filtering by `agent: 'codex'` blacklist.
+- Codex CLI builds a `CodexProxyRoute[]` from resolved entries and starts a single multi-route proxy (`startCodexProxy(routes, { requireAuth: true })`).
+- The proxy port is exposed to the child via `OPENAI_API_KEY=proxy-local`.
+- Catalog slugs are `${providerId}__${modelId}` (CLI) or `codexAppModelSlug(modelId)` (App).
+- `--restore` globs `models-*.json` (CLI) and `app-models-*.json` (App); the new files are `models-favorites.json` and `app-models-favorites.json`.
+- Zen/Go favorites are skipped in Codex (use Claude or Desktop gateway).
+
+**Linux desktop app launch:** `src/linux-display.ts::linuxLaunchEnv()` resolves the X11 display that owns the launching terminal's `WINDOWID` and `WM_CLASS`. `codex/app-launch.ts` and `claude-desktop/app-launch.ts` pass that environment to the detached Linux executable instead of using `gtk-launch`, which can route an app to another graphical session. Linux app restarts are deterministic because tray-hidden Electron processes must exit before Relay's temporary configuration can be reloaded. Verified on Ubuntu over RDP with the ChatGPT desktop app and a DeepSeek model.
+
+**ChatGPT/Codex desktop app rename (2026-07-09):** OpenAI merged the standalone Codex desktop app into the ChatGPT desktop app. `relay-ai chatgpt` is a full alias for `relay-ai codex-app` (added in `cli.ts`'s `first === 'codex-app' || first === 'chatgpt'` check — `emptyParsed('codex-app')` still drives dispatch either way, so no new `ParsedArgs['command']` variant was needed). On macOS the app is confirmed renamed `Codex.app` → `ChatGPT.app`, with the bundle id unchanged (`com.openai.codex`) and the running process/executable renamed `Codex` → `ChatGPT` — `src/codex/app-launch.ts`'s `DARWIN_APP_NAMES = ['ChatGPT', 'Codex']` and `native-launcher.ts`'s Windows/macOS fallback paths check both names so pre-update installs keep working. The Windows path/process names were updated by analogy with the confirmed macOS rename (same install-folder convention) via `WIN_APP_NAMES` in `app-launch.ts` — **not yet verified against a real Windows install**; confirm and correct if the actual folder/exe name differs once available.
+
+**Windows desktop-app restart bug (fixed 2026-07-09):** `waitForQuit()` in `codex/app-launch.ts` and `claude-desktop/app-launch.ts` used to treat "no visible main window" (`winHasWindow()`) as "the app has quit." Electron apps that minimize to the tray on window-close clear their window handle immediately while the process stays alive, so this returned `true` instantly, skipping the `winForceQuit()` fallback — the old process (with its already-loaded config) kept running, and a relaunch just refocused it. Fixed to poll actual process existence (`winMatchingPids().length === 0`) instead. `antigravity/launch-ide.ts`'s Windows detection was written process-existence-based from the start (`Win32_Process` filtered by `--user-data-dir`) so it didn't have this bug, but its `winQuitProcess()` (graceful `CloseMainWindow()` only) had no force-kill fallback at all — added `forceQuitAntigravityApp`/`forceQuitAntigravityIde`, wired into `antigravity.ts`'s four quit call sites after a `waitForAntigravity*Quit` timeout.
+
+**Antigravity Windows support (added 2026-07-09):** `findAntigravityAppBinary()`/`findAntigravityIdeBinary()` in `antigravity/launch-ide.ts` were hardcoded `if (process.platform !== 'darwin') return null;` — Windows always failed with a macOS-specific "not installed" error regardless of actual install state. Real paths confirmed against a live install: `%LOCALAPPDATA%\Programs\antigravity\Antigravity.exe` and `%LOCALAPPDATA%\Programs\Antigravity IDE\Antigravity IDE.exe` (Windows paths are case-insensitive, so the `Antigravity`/`antigravity` casing mismatch doesn't matter). The manual path override (`getAppPathOverride`) was also dead code on non-macOS before this fix — it's now checked before the platform branch.
+
+**Antigravity model catalog + effort variants (0.15.0):** Antigravity uses the general `favoriteModels` list (the separate `antigravityCliFavoriteModels` list was retired; `config.ts::migrateAntigravityFavorites()` folds it into general favorites once, deduped and capped, then deletes the key). `antigravity/catalog.ts::buildAntigravityRoutes()` expands each model into one route per effort level, because Antigravity has no effort control: every level for the launch model, `favoriteEffortLevels()` (medium + the two above it, topped up from below) for favorites, one plain route for models without adjustable effort. Each variant carries `reasoningEffort` + `reasoningMetadata`, which `cloud-code-gateway.ts` passes to `effortProviderOptions()` (unset → `'high'`, the old behavior). `planRelayCatalogSlots()` fills the 7 validated native slots first, then lists every further route as a Relay-only entry with an unused `MODEL_PLACEHOLDER_M400+` enum and a **hyphen-only picker ID** from `overflowSlotId()`. Antigravity IDE 2.5.5 silently hides picker entries whose ID contains underscores (verified live — Relay's `relay-ai__provider__model` catalog IDs were hidden, `relay-grok-build-0-1` showed and routed); that, not the native slot count, was the real reason for the old 7-model ceiling. Do not reintroduce underscores into picker IDs. Launches cap at `MAX_MODEL_CATALOG` entries; effort variants count toward it.
+
+**Antigravity effort menus — agy slider / app submenu / IDE rows (`effortMode`, 0.15.2):** `AntigravityEffortMode` in `antigravity/catalog.ts` (`'slider' | 'submenu' | 'rows'`, default `rows`) picks how each surface lists a model's effort levels; `runAgyCommand`/`runAntigravityAppCommand`/`runAntigravityIdeCommand` pass it through `resolveAndBuildRoutes` → `buildAntigravityRoutes(..., { effortMode })`. Folding is driven by entry **labels**, all verified live: agy folds picker IDs ending `-low`/`-medium`/`-high`/`-max` into its native 4-position slider (agy 1.2.11); the Antigravity **app** and IDE fold display labels matching `^(.*) \((low|medium|high)\)$` (the language_server's `ClientModelGroup`/`modelLabels`) into a hover submenu. **slider** and **submenu** emit the same curated set (low/medium/high/max + xhigh, no none) for every model and set gateway `nativeSlots: false` — every route is a Relay-only entry, because borrowed native Google slots group by Google's families into mislabeled sliders/submenus. slider names its group's first entry plainly (agy labels the row after its first entry); submenu renames low/medium/high entries to end in `(Low)`/`(Medium)`/`(High)` in a post-pass in `buildAntigravityRoutes` (run *after* `applyUniqueAntigravityRouteLabels()` appends `(Relay - Provider)`, so the level lands at the very end where the app's regex matches), leaving xhigh/max as their own rows. **rows** (IDE) keeps native slots (`nativeSlots: true`) and lists one plain row per level — every level for the launch model, `favoriteEffortLevels()` for favorites — because the IDE's submenu is clipped by its scrolling model list (it works only when the list is short enough not to scroll; the app's list scrolls without clipping the submenu). `nativeSlots` is `RelaySlotOptions`, threaded through `injectRelayModels`, `resolveRelayCatalogSlots` and `buildListModelConfigsResponse` — every pass must agree or routing IDs diverge. `agyLaunchModelLabel()` opens agy on the launch model's medium entry; the app/IDE open on the launch model via `clearAppLastSelectedModel()` / `clearSavedModelSelection()`. `applyUniqueAntigravityRouteLabels()` always appends the provider: `Model (Relay - Provider)`.
+
+**Antigravity app remembered model:** the app stores its last pick as a model enum in `~/.gemini/antigravity/antigravity_state.pbtxt` (`last_selected_agent_model:` line) — the language server's `--app_data_dir`, derived from the app's name and shared with non-Relay use (it can't be isolated like the Electron `--user-data-dir`). `ide-profile.ts::clearAppLastSelectedModel()` removes that one line before each Relay app launch.
+
+**Reasoning effort from models.dev (0.15.0):** `registry/models-dev.ts::resolveModelReasoningMetadata()` prefers the serving provider's own models.dev entry for effort levels over the cross-bucket intersection (one reseller listing fewer levels — e.g. Cortecs for GPT-6 Sol — used to strip `none`/`xhigh`/`max` from everyone); the intersection still applies when the provider has no entry. `openai-oauth` maps to the `openai` bucket. On `@ai-sdk/openai`, `provider-factory.ts::openAiAllowedEffortLevels()` uses the hand-written per-model profile when one exists, else models.dev's declared levels, else low/medium/high — so new OpenAI models need no table edit. ChatGPT-login models discovered live (`refresh-models.ts::buildDynamicOAuthModel`) take `reasoning` from models.dev, and `materialize.ts` prefers models.dev over a saved `reasoning` value for `openai-oauth` so caches saved with the old gpt-5.x-only name guess self-heal without a refresh.
+
+**Claude desktop effort entries (0.15.0):** Claude Desktop shows an effort slider only for models in Anthropic's signed catalog (Claude models), and gateway config can only cap effort, not add levels. `claude-desktop/model-catalog.ts::expandClaudeAppEffortVariants()` lists each `openai`-format model with controllable effort once per level (all for the launch model, `favoriteEffortLevels()` for favorites; ids `<id>-effort-<level>`, `upstreamModelId` preserved), capped at `MAX_MODEL_CATALOG`. Each carries `ServerModelInfo.fixedEffort`, which `server/router.ts` passes as `TranslateRequestOptions.fixedEffort` — it wins over the client's `output_config.effort`.
+
+**Launch picker refresh:** `prompts.ts::pickProviderModel()` is the shared recent/browse loop behind `pickLocalModel`, `pickCodexModel` and `pickGeminiModel`. Given a `refresh` callback it shows "↻ Refresh models" (recent screen, small list, and the large-catalog menu) and reopens after refreshing. Callers build the callback with `picker-refresh.ts::pickerRefresh(provider, reload)`, which runs `runProvidersRefreshModels(id)` then swaps in `reload()`'s models — `reload` must rebuild the provider with the command's own filtering (`providersForTarget` / `codexCompatibleProviders` / `providerForCodexPicker` …). The helper lives outside `prompts.ts` because `providers-command.ts` imports `prompts.ts`.
+
+**Server tab (`relay-ai ui`):** Runs the same gateway as `relay-ai server`, in-process inside the `relay-ai ui` web server — no child process, no PID file. Stops automatically when the UI process exits.
+- `src/ui/server-control.ts` — lifecycle module: `startGatewayServer(request)`, `stopGatewayServer()`, `getServerStatus()`. Holds the single `ServerHandle` + loaded model list in module state. Reuses `loadServerModels`, `resolveServerUpstreamApiKey`, `getLocalIps` (exported from `src/server/index.ts`) and `filterServerModelsByProviders`/`filterServerModelsByFavorites` (`src/server/catalog-filter.ts`) — identical filtering logic to the CLI wizard.
+- API routes in `src/ui/api.ts`: `GET /api/server/status` (current state + saved wizard defaults for pre-filling the form), `GET /api/server/providers` (provider picker list via `fetchProviderCatalog` + `providersForTarget(catalog, 'server')`), `POST /api/server/start`, `POST /api/server/stop`.
+- Persists the same settings the CLI wizard saves (`setServerExposedProviders`, `setServerMaskGatewayIds`, `setServerFavoritesOnly`, `setSavedServerPassword`) so a `relay-ai server` quick-start run in the terminal picks up whatever was last configured from the browser, and vice versa.
+- A network-mode password is never sent back to the browser as `passwordMode: 'saved'` — the client only learns `hasSavedPassword: boolean`; the actual saved password is resolved server-side.
+- `EADDRINUSE` on port `17645` (e.g. a terminal `relay-ai server` already running) surfaces as a specific inline error rather than a generic failure.
+- Frontend (`src/ui/public/app.js`, `state.server`): polls `GET /api/server/status` every 5s (cheap enough to run continuously; also drives the sidebar "Live" badge). Setup-state and running-state are two fully-templated views swapped into a single `#server-panel` container, matching the file's existing full-innerHTML-replace convention (see `renderApps()`).
+
+## Release status
+
+The package version in `package.json` is the source of truth. The maintenance notes below describe architecture and known limitations; do not infer the current release version from this file.
+
+
+**Known limitations (by design):**
+- Cost display in Claude Code is always inaccurate for non-Anthropic models.
+- OAuth-authenticated providers (no stored key) are silently skipped.
+- `@ai-sdk/github-copilot` won't work — OpenCode loads it from internal `@opencode-ai/core`, not a public npm factory we can ship.
+- Bedrock/Azure are not first-class API-key providers yet (optional `providers import` if already configured in OpenCode CLI). Vertex uses `relay-ai server --vertex` + gcloud ADC.
+- Providers with custom auth mechanisms (e.g. Azure OpenAI with deployment URLs) are not fully supported.
+- The `::ts::` separator in tool_use ids encodes `thought_signature`; would break if a signature ever literally contained `::ts::`. Extremely unlikely.
+- In switch-menu (gateway-discovery) mode the displayed context window reflects the **launch** model and does NOT update on live `/model` switch. Claude Code's gateway model discovery only carries `id` + `display_name` (no `context_window`) and fetches `/v1/models` once at startup, so `CLAUDE_CODE_MAX_CONTEXT_TOKENS` (fixed at launch) is the only lever. Single-model launches show the correct window.
+- Not every `modelFormat` is exposed via `relay-ai server`/`relay-ai ui` yet — `target-compatibility.ts` excludes formats from the `server` target that `server/router.ts` has no handler for (it only implements `'anthropic'` and `'openai'`).
+- **Minimum context window per target** — `target-compatibility.ts::meetsContextFloor(target, contextWindow)` / `contextFloorForTarget(target)` hide models below a per-target floor: 128K (`MIN_CONTEXT_WINDOW` in `constants.ts`) for Claude/Codex/desktop-apps/Gemini, 136K (`ANTIGRAVITY_MIN_CONTEXT_WINDOW` in `antigravity/catalog.ts`) for Antigravity, no floor for `server`. Models with an unreported `contextWindow` always pass (missing registry metadata ≠ small model). `antigravity/launch-routes.ts::resolveAntigravityLaunchRoutes()` applies the same check to saved favorites (the launch model itself is already filtered by the picker, so favorites are checked from index 1). `relay-ai ui`'s per-app launch pickers get the same filtering: `/api/models?appId=…` passes the target to `providersForTarget()`.
+- Antigravity's cascade executor requires `contextWindow - maxOutputTokens >= ANTIGRAVITY_REQUIRED_INPUT_TOKENS` (128000) or it refuses to start with `config.MaxTokenLimit ... cannot exceed the planner model's context window limit`. `antigravity/catalog.ts::applyRouteContextBounds()` caps a route's `maxOutputTokens` to leave that headroom, and every checkpoint config in the served catalog (visible routes + hidden cascade/plan anchors) is clamped to the smallest route in the launch via `clampCheckpointTokenLimit()`, since it's not established which catalog entry agy actually reads the limit from.
+- **`freeAccess` in `classifyFreeStatus()` (`free-models.ts`)** — a provider-granted free-access rule (e.g. Cloudflare's 10,000 free Neurons/day on standard models) that must be set explicitly by the caller from a provider rule, never derived from a model's own `isFree` flag — an `isFree: true` flag must never outrank real non-zero pricing. `registry/fetch-template-models.ts` sets it for eligible Cloudflare models; `registry/pricing.ts::enrichModelsWithPricing()` re-passes it as `model.freeStatus === 'free_provider'` so free access survives a later real-pricing lookup.
+
+**Provider quirks (documented from testing):**
+- **Mistral free tier:** strict API rate limits (HTTP 429, code `1300`). Tool-heavy Claude Code sessions burn quota quickly (parallel title-generation requests, Skill injection, multi-turn tool loops). The SDK handles Mistral message ordering; throttling is unaffected.
+- **OpenAI direct (`@ai-sdk/openai` local provider):** newer models (GPT-5.4+, GPT-5.5, `*-codex`, o-series) require the Responses API — `provider-factory.modelPrefersResponsesApi()` selects `openai.responses(id)` for them, `openai.chat(id)` otherwise. OpenCode catalog IDs may differ from upstream API IDs — `upstreamModelId` uses OpenCode's `api.id` (e.g. `gpt-5.5-fast` → `gpt-5.5`). GPT-5.5 reasoning round-trips via encrypted content in `thinking.signature`. Cloud OpenCode Zen/Go GPT models remain hidden in the wizard (`unsupported`); use the local OpenAI provider for GPT access.

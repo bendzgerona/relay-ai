@@ -1,0 +1,589 @@
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import {
+  emptyRegistry,
+  isValidProviderId,
+  loadRegistry,
+  materializeRegistry,
+  saveRegistry,
+  slugifyProviderId,
+} from '../src/registry/index.js';
+import { cachedModelToLocal } from '../src/registry/materialize.js';
+
+describe('provider id validation', () => {
+  it('accepts stable slugs', () => {
+    expect(isValidProviderId('groq')).toBe(true);
+    expect(isValidProviderId('openai')).toBe(true);
+    expect(isValidProviderId('custom-together-ai')).toBe(true);
+    expect(isValidProviderId('go')).toBe(true);
+  });
+
+  it('rejects invalid ids', () => {
+    expect(isValidProviderId('OpenAI')).toBe(false);
+    expect(isValidProviderId('has space')).toBe(false);
+    expect(isValidProviderId('bad:id')).toBe(false);
+    expect(isValidProviderId('-leading')).toBe(false);
+    expect(isValidProviderId('trailing-')).toBe(false);
+  });
+
+  it('slugifies display names', () => {
+    expect(slugifyProviderId('Together AI')).toBe('together-ai');
+    expect(slugifyProviderId('My vLLM Server')).toBe('my-vllm-server');
+  });
+});
+
+describe('registry io', () => {
+  let home: string;
+  const prev = process.env.RELAY_AI_HOME;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'relay-ai-registry-'));
+    process.env.RELAY_AI_HOME = home;
+  });
+
+  afterEach(() => {
+    if (prev === undefined) delete process.env.RELAY_AI_HOME;
+    else process.env.RELAY_AI_HOME = prev;
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('round-trips registry json', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:groq',
+      api: { npm: '@ai-sdk/groq' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'llama-3.3-70b',
+          name: 'Llama 3.3 70B',
+          upstreamModelId: 'llama-3.3-70b',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/groq',
+        }],
+      },
+    });
+    saveRegistry(registry);
+    const loaded = loadRegistry();
+    expect(loaded.providers).toHaveLength(1);
+    expect(loaded.providers[0]?.id).toBe('groq');
+    expect(loaded.providers[0]?.modelsCache?.models[0]?.npm).toBe('@ai-sdk/groq');
+  });
+
+  it('writes providers.json with restrictive permissions', () => {
+    saveRegistry(emptyRegistry());
+    const path = join(home, 'providers.json');
+    expect(existsSync(path)).toBe(true);
+    // POSIX permission bits only apply off Windows; NTFS uses ACLs and Node
+    // reports 0o666 regardless of the 0o600 the writer requests.
+    if (process.platform !== 'win32') {
+      const mode = statSync(path).mode & 0o777;
+      expect(mode).toBe(0o600);
+    }
+  });
+
+  it('skips invalid provider entries on load', () => {
+    const path = join(home, 'providers.json');
+    const raw = {
+      schemaVersion: 1,
+      providers: [
+        { id: 'BAD ID', templateId: 'x', name: 'X', enabled: true, authRef: 'k', api: {}, addedAt: 't' },
+        {
+          id: 'groq',
+          templateId: 'groq',
+          name: 'Groq',
+          enabled: true,
+          authRef: 'keyring:provider:groq',
+          api: { npm: '@ai-sdk/groq' },
+          addedAt: '2026-06-09T00:00:00.000Z',
+        },
+      ],
+    };
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path, JSON.stringify(raw));
+    const loaded = loadRegistry(path);
+    expect(loaded.providers).toHaveLength(1);
+    expect(loaded.providers[0]?.id).toBe('groq');
+  });
+
+  it('removes legacy OpenCode cloud duplicates on load and persists the cleanup', () => {
+    const path = join(home, 'providers.json');
+    const base = {
+      enabled: true,
+      authRef: 'keyring:global:opencode',
+      api: {},
+      addedAt: '2026-06-18T00:00:00.000Z',
+    };
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      providers: [
+        { ...base, id: 'zen', templateId: 'zen', name: 'OpenCode Zen' },
+        { ...base, id: 'opencode', templateId: 'opencode', name: 'OpenCode Zen' },
+        { ...base, id: 'go', templateId: 'go', name: 'OpenCode Go' },
+        { ...base, id: 'opencode-go', templateId: 'opencode-go', name: 'OpenCode Go' },
+      ],
+    }));
+
+    const loaded = loadRegistry(path);
+
+    expect(loaded.providers.map(provider => provider.id)).toEqual(['zen', 'go']);
+    expect(JSON.parse(readFileSync(path, 'utf8')).providers.map((provider: { id: string }) => provider.id))
+      .toEqual(['zen', 'go']);
+  });
+
+  it('renames a legacy OpenCode cloud provider when no canonical entry exists', () => {
+    const path = join(home, 'providers.json');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      providers: [{
+        id: 'opencode',
+        templateId: 'opencode',
+        name: 'OpenCode',
+        enabled: true,
+        authRef: 'keyring:provider:opencode',
+        api: { npm: '@ai-sdk/openai-compatible', url: 'https://opencode.ai/zen/v1' },
+        addedAt: '2026-06-18T00:00:00.000Z',
+      }],
+    }));
+
+    const loaded = loadRegistry(path);
+
+    expect(loaded.providers[0]).toMatchObject({
+      id: 'zen',
+      templateId: 'zen',
+      name: 'OpenCode Zen',
+      authRef: 'keyring:provider:opencode',
+      api: {},
+    });
+  });
+
+  it('renames and persists only the exact legacy Alibaba China label', () => {
+    const path = join(home, 'providers.json');
+    const legacy = {
+      id: 'alibaba',
+      templateId: 'alibaba',
+      name: 'Alibaba DashScope',
+      enabled: true,
+      authRef: 'keyring:provider:alibaba',
+      api: { npm: '@ai-sdk/alibaba', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+      addedAt: '2026-07-19T00:00:00.000Z',
+    };
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path, JSON.stringify({ schemaVersion: 1, providers: [legacy] }));
+
+    const loaded = loadRegistry(path);
+
+    expect(loaded.providers[0]?.name).toBe('Alibaba DashScope (China)');
+    expect(JSON.parse(readFileSync(path, 'utf8')).providers[0]?.name).toBe('Alibaba DashScope (China)');
+  });
+
+  it.each([
+    { name: 'Alibaba DashScope', url: 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' },
+    { name: 'My DashScope', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1' },
+  ])('does not rename a non-legacy Alibaba entry (%o)', ({ name, url }) => {
+    const path = join(home, 'providers.json');
+    mkdirSync(home, { recursive: true });
+    writeFileSync(path, JSON.stringify({
+      schemaVersion: 1,
+      providers: [{
+        id: 'alibaba',
+        templateId: 'alibaba',
+        name,
+        enabled: true,
+        authRef: 'keyring:provider:alibaba',
+        api: { npm: '@ai-sdk/alibaba', url },
+        addedAt: '2026-07-19T00:00:00.000Z',
+      }],
+    }));
+
+    const loaded = loadRegistry(path);
+
+    expect(loaded.providers[0]?.name).toBe(name);
+  });
+});
+
+describe('materializeRegistry', () => {
+  it('does not invent a context window for ClinePass models without metadata', () => {
+    const provider = {
+      id: 'cline-pass',
+      templateId: 'cline-pass',
+      name: 'ClinePass',
+      enabled: true,
+      authRef: 'keyring:provider:cline-pass',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.cline.bot/api/v1' },
+      addedAt: '2026-08-06T00:00:00.000Z',
+    };
+    const local = cachedModelToLocal({
+      id: 'cline-pass/kimi-k3',
+      name: 'Kimi K3',
+      upstreamModelId: 'cline-pass/kimi-k3',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+    }, provider);
+
+    expect(local?.contextWindow).toBeUndefined();
+  });
+
+  it('ignores the legacy synthetic ClinePass context value in existing caches', () => {
+    const provider = {
+      id: 'cline-pass',
+      templateId: 'cline-pass',
+      name: 'ClinePass',
+      enabled: true,
+      authRef: 'keyring:provider:cline-pass',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.cline.bot/api/v1' },
+      addedAt: '2026-08-06T00:00:00.000Z',
+    };
+    const local = cachedModelToLocal({
+      id: 'cline-pass/kimi-k3',
+      name: 'Kimi K3',
+      upstreamModelId: 'cline-pass/kimi-k3',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      contextWindow: 131072,
+    }, provider);
+
+    expect(local?.contextWindow).toBeUndefined();
+  });
+
+  it("trusts models.dev over a saved name-guess for ChatGPT-login models", () => {
+    const provider = {
+      id: 'openai-oauth',
+      templateId: 'openai',
+      name: 'OpenAI (ChatGPT)',
+      enabled: true,
+      authRef: 'keyring:provider:openai-oauth',
+      authType: 'oauth' as const,
+      api: { npm: '@ai-sdk/openai' },
+      addedAt: '2026-09-23T00:00:00.000Z',
+    };
+    const metadata = {
+      openai: { id: 'openai', models: { 'gpt-x': { id: 'gpt-x', reasoning: true, reasoning_options: [{ type: 'effort', values: ['none', 'low', 'medium', 'high', 'xhigh', 'max'] }] } } },
+    } as any;
+    // Saved before the fix: an unseeded model got reasoning:false from a gpt-5.x-only name rule.
+    const stale = { id: 'gpt-x', name: 'gpt-x', upstreamModelId: 'gpt-x', modelFormat: 'openai' as const, npm: '@ai-sdk/openai', reasoning: false };
+
+    const local = cachedModelToLocal(stale, provider, metadata);
+    expect(local?.reasoning).toBe(true);
+    expect(local?.reasoningEffortLevels).toEqual(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+    // Other providers keep their saved value.
+    const other = cachedModelToLocal(stale, { ...provider, id: 'custom-openai' }, metadata);
+    expect(other?.reasoning).toBe(false);
+  });
+
+  it('materializes enabled providers with credentials and models', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'openai',
+      templateId: 'openai',
+      name: 'OpenAI',
+      enabled: true,
+      authRef: 'keyring:provider:openai',
+      authType: 'oauth',
+      api: { npm: '@ai-sdk/openai' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'gpt-5.5-fast',
+          name: 'GPT-5.5 Fast',
+          upstreamModelId: 'gpt-5.5',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai',
+        }],
+      },
+    });
+    const locals = materializeRegistry(registry, () => 'sk-test');
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.models[0]?.upstreamModelId).toBe('gpt-5.5');
+    expect(locals[0]?.apiKey).toBe('sk-test');
+    expect(locals[0]?.authType).toBe('oauth');
+  });
+
+  it('repairs a stale OpenCode Go cache entry from current model metadata', () => {
+    const local = cachedModelToLocal({
+      id: 'union-alpha',
+      name: 'Union Alpha Free',
+      upstreamModelId: 'union-alpha',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      apiUrl: 'https://opencode.ai/zen/go/v1',
+    }, {
+      id: 'go',
+      templateId: 'go',
+      name: 'OpenCode Go',
+      enabled: true,
+      authRef: 'keyring:global:opencode',
+      api: {},
+      addedAt: '2026-09-16T00:00:00.000Z',
+    }, {
+      'opencode-go': {
+        models: {
+          'union-alpha': {
+            id: 'union-alpha',
+            name: 'Union Alpha Free',
+            provider: { npm: '@ai-sdk/anthropic' },
+          },
+        },
+      },
+    });
+
+    expect(local).toMatchObject({
+      id: 'union-alpha',
+      modelFormat: 'anthropic',
+      npm: '@ai-sdk/anthropic',
+      baseUrl: 'https://opencode.ai/zen/go',
+    });
+  });
+
+  it('populates cross-bucket reasoning-effort levels from models.dev metadata', () => {
+    const provider = {
+      id: 'commandcode',
+      templateId: 'commandcode',
+      name: 'Command Code',
+      enabled: true,
+      authRef: 'keyring:provider:commandcode',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.commandcode.ai/v1' },
+      addedAt: '2026-09-24T00:00:00.000Z',
+    };
+    const effortRow = (values: string[]) => ({
+      id: 'meta/muse-spark-1.3-contributor',
+      reasoning: true,
+      reasoning_options: [{ type: 'effort', values }],
+    });
+    const metadata = {
+      'nano-gpt': { id: 'nano-gpt', models: { 'meta/muse-spark-1.3-contributor': effortRow(['minimal', 'low', 'medium', 'high', 'xhigh']) } },
+      kilo: { id: 'kilo', models: { 'meta/muse-spark-1.3-contributor': effortRow(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']) } },
+    };
+    const local = cachedModelToLocal({
+      id: 'meta/muse-spark-1.3-contributor',
+      name: 'Muse Spark 1.3',
+      upstreamModelId: 'meta/muse-spark-1.3-contributor',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      apiUrl: 'https://api.commandcode.ai/v1',
+    }, provider, metadata as never);
+
+    expect(local?.reasoningEffortLevels).toEqual(['minimal', 'low', 'medium', 'high', 'xhigh']);
+    expect(local?.reasoningEffortConflict).toBeUndefined();
+  });
+
+  it('returns empty when credential missing', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'groq',
+      templateId: 'groq',
+      name: 'Groq',
+      enabled: true,
+      authRef: 'keyring:provider:groq',
+      api: { npm: '@ai-sdk/groq' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'llama',
+          name: 'Llama',
+          upstreamModelId: 'llama',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/groq',
+        }],
+      },
+    });
+    expect(materializeRegistry(registry, () => null)).toHaveLength(0);
+  });
+
+  it('allows anonymous Kilo but exposes only verified free models', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'kilo',
+      templateId: 'kilo',
+      name: 'Kilo Code',
+      enabled: true,
+      authRef: 'keyring:provider:kilo',
+      authType: 'api',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://api.kilo.ai/api/gateway' },
+      addedAt: '2026-07-06T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-07-06T00:00:00.000Z',
+        models: [
+          {
+            id: 'tencent/hy3:free',
+            name: 'Tencent: Hy3 (free)',
+            upstreamModelId: 'tencent/hy3:free',
+            modelFormat: 'openai',
+            npm: '@ai-sdk/openai-compatible',
+            cost: { input: 0, output: 0 },
+            isFree: true,
+            freeStatus: 'verified_free',
+          },
+          {
+            id: 'anthropic/claude-sonnet-4.5',
+            name: 'Claude Sonnet 4.5',
+            upstreamModelId: 'anthropic/claude-sonnet-4.5',
+            modelFormat: 'openai',
+            npm: '@ai-sdk/openai-compatible',
+            cost: { input: 3, output: 15 },
+            isFree: false,
+            freeStatus: 'paid',
+          },
+        ],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => null);
+
+    expect(locals).toHaveLength(1);
+    expect(locals[0]?.apiKey).toBe('');
+    expect(locals[0]?.models.map(m => m.id)).toEqual(['tencent/hy3:free']);
+    expect(locals[0]?.models[0]).toMatchObject({
+      isFree: true,
+      freeStatus: 'verified_free',
+    });
+  });
+
+  it('marks NVIDIA imported models as free provider access', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'nvidia',
+      templateId: 'nvidia',
+      name: 'NVIDIA NIM',
+      enabled: true,
+      authRef: 'keyring:provider:nvidia',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://integrate.api.nvidia.com/v1' },
+      addedAt: '2026-07-06T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-07-06T00:00:00.000Z',
+        models: [{
+          id: 'nvidia/llama-3.1-nemotron',
+          name: 'NVIDIA Nemotron',
+          upstreamModelId: 'nvidia/llama-3.1-nemotron',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai-compatible',
+        }],
+      },
+    });
+
+    const locals = materializeRegistry(registry, () => 'nvapi-test');
+
+    expect(locals[0]?.models[0]).toMatchObject({
+      isFree: true,
+      freeStatus: 'free_provider',
+    });
+  });
+
+  it('honors per-model npm and apiUrl overrides', () => {
+    const registry = emptyRegistry();
+    registry.providers.push({
+      id: 'custom-proxy',
+      templateId: 'custom-openai',
+      name: 'Custom Proxy',
+      enabled: true,
+      authRef: 'keyring:provider:custom-proxy',
+      api: { npm: '@ai-sdk/openai-compatible', url: 'https://default.example/v1' },
+      addedAt: '2026-06-09T00:00:00.000Z',
+      modelsCache: {
+        fetchedAt: '2026-06-09T00:00:00.000Z',
+        models: [{
+          id: 'model-a',
+          name: 'Model A',
+          upstreamModelId: 'model-a',
+          modelFormat: 'openai',
+          npm: '@ai-sdk/openai-compatible',
+          apiUrl: 'https://override.example/v1',
+        }],
+      },
+    });
+    const locals = materializeRegistry(registry, () => 'key');
+    expect(locals[0]?.models[0]?.apiBaseUrl).toBe('https://override.example/v1');
+    expect(locals[0]?.models[0]?.completionsUrl).toBe('https://override.example/v1/chat/completions');
+  });
+});
+
+describe('ensureOpencodeCloudProviders', () => {
+  let home: string;
+  const prevHome = process.env.RELAY_AI_HOME;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'relay-ai-ensure-opencode-'));
+    process.env.RELAY_AI_HOME = home;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.RELAY_AI_HOME;
+    else process.env.RELAY_AI_HOME = prevHome;
+    rmSync(home, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('seeds zen and go when an OpenCode key is available and registry is empty', async () => {
+    vi.spyOn(await import('../src/registry/refresh-models.js'), 'refreshProviderModels')
+      .mockImplementation(async id => ({ id, name: id, ok: true, modelCount: 0 }));
+    const { ensureOpencodeCloudProviders, loadRegistry } = await import('../src/registry/index.js');
+    const result = await ensureOpencodeCloudProviders(async () => true);
+    expect(result.seeded).toBe(true);
+    const ids = loadRegistry().providers.map(p => p.id).sort();
+    expect(ids).toEqual(['go', 'zen']);
+  });
+
+  it('does nothing when no OpenCode key is available', async () => {
+    const { ensureOpencodeCloudProviders, loadRegistry } = await import('../src/registry/index.js');
+    const result = await ensureOpencodeCloudProviders(async () => false);
+    expect(result.seeded).toBe(false);
+    expect(result.refreshed).toEqual([]);
+    expect(loadRegistry().providers).toHaveLength(0);
+  });
+});
+
+describe('addOpencodeCloudFromApiKey', () => {
+  let home: string;
+  const prevHome = process.env.RELAY_AI_HOME;
+  const prevKey = process.env.OPENCODE_API_KEY;
+
+  beforeEach(() => {
+    home = mkdtempSync(join(tmpdir(), 'relay-ai-add-opencode-'));
+    process.env.RELAY_AI_HOME = home;
+    delete process.env.OPENCODE_API_KEY;
+  });
+
+  afterEach(() => {
+    if (prevHome === undefined) delete process.env.RELAY_AI_HOME;
+    else process.env.RELAY_AI_HOME = prevHome;
+    if (prevKey === undefined) delete process.env.OPENCODE_API_KEY;
+    else process.env.OPENCODE_API_KEY = prevKey;
+    rmSync(home, { recursive: true, force: true });
+    vi.restoreAllMocks();
+  });
+
+  it('adds zen+go from an API key without requiring a base URL', async () => {
+    vi.spyOn(await import('../src/env.js'), 'saveToCredentialStore').mockResolvedValue(true);
+    vi.spyOn(await import('../src/registry/refresh-models.js'), 'refreshProviderModels')
+      .mockResolvedValue({ id: 'zen', name: 'OpenCode Zen', ok: true, modelCount: 3 });
+
+    const { addOpencodeCloudFromApiKey, loadRegistry } = await import('../src/registry/index.js');
+    const { addProviderFromTemplate } = await import('../src/registry/add-template.js');
+    const { getTemplateById } = await import('../src/provider-templates.js');
+
+    const direct = await addOpencodeCloudFromApiKey('sk-opencode-test');
+    expect(direct.added).toBe(true);
+    expect(direct.modelCount).toBe(6); // zen + go mocked to 3 each
+    expect(direct.error).toBeUndefined();
+    expect(loadRegistry().providers.map(p => p.id).sort()).toEqual(['go', 'zen']);
+    expect(process.env.OPENCODE_API_KEY).toBe('sk-opencode-test');
+
+    // UI path: template add must not fall through to "needs a base URL"
+    const template = getTemplateById('opencode-cloud')!;
+    const viaTemplate = await addProviderFromTemplate(template, 'sk-other');
+    expect(viaTemplate.added).toBe(false);
+    expect(viaTemplate.error).toMatch(/already configured/i);
+  });
+});

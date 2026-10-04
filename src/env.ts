@@ -1,0 +1,605 @@
+// src/env.ts
+import { CONFLICTING_ENV_VARS, PARENT_SESSION_ENV_VARS } from './constants.js';
+import { claudeCodeClientModelId, stripOneMContextSuffix } from './context-model-id.js';
+import { resolveContextWindow } from './context-window.js';
+import { oauthCredentialToKeychainJson } from './registry/opencode-auth.js';
+import {
+  parseStoredOAuthCredential,
+} from './oauth/types.js';
+import { refreshStoredOAuthCredential, oauthCredentialShouldRefresh } from './oauth/refresh.js';
+import { fetchCopilotAccount } from './oauth/github.js';
+import {
+  deleteFileAccount,
+  readFileAccount,
+  writeFileAccount,
+} from './secrets-file.js';
+import type { ConflictInfo } from './types.js';
+
+export function detectConflicts(): ConflictInfo[] {
+  return CONFLICTING_ENV_VARS
+    .filter(name => process.env[name] !== undefined)
+    .map(name => ({ name, value: process.env[name]! }));
+}
+
+export function resolveApiKey(): string | null {
+  const key = process.env['OPENCODE_API_KEY'];
+  // Treat empty string as missing — happens when .zshrc auto-load line runs
+  // but the Keychain entry has been deleted (security command returns nothing)
+  if (!key?.trim()) return null;
+  // First line only — users sometimes paste notes below the key in shell profiles
+  return key.trim().split(/\r?\n/)[0]?.trim() || null;
+}
+
+/** Restore first-party-like Claude Code behavior when routing through a proxy or gateway. */
+export function applyClaudeCodeThirdPartyCompat(env: NodeJS.ProcessEnv): void {
+  // Custom ANTHROPIC_BASE_URL disables MCP tool search by default, loading every
+  // MCP tool (100+) on every turn. Requires defer_loading on tools — do not set
+  // CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS when using the local translation proxy.
+  env['ENABLE_TOOL_SEARCH'] = 'true';
+  // Third-party routes may enable a shorter system prompt that drops conversational
+  // guardrails while hooks/plugins still inject agentic instructions.
+  env['CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT'] = '0';
+}
+
+export function buildChildEnv(
+  baseUrl: string,
+  model: string,
+  apiKey: string,
+  proxyPort?: number,
+  contextWindow?: number,
+  enableGatewayDiscovery?: boolean,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of CONFLICTING_ENV_VARS) {
+    delete env[name];
+  }
+  for (const name of PARENT_SESSION_ENV_VARS) {
+    delete env[name];
+  }
+  env['ANTHROPIC_BASE_URL'] = proxyPort
+    ? `http://127.0.0.1:${proxyPort}`
+    : baseUrl;
+  env['ANTHROPIC_API_KEY'] = apiKey;
+  const bareModel = stripOneMContextSuffix(model);
+  env['ANTHROPIC_MODEL'] = claudeCodeClientModelId(model, contextWindow);
+  // Keep an explicit context budget for single-model proxy sessions. With
+  // gateway discovery enabled, Claude Code can recalculate the window when the
+  // user switches models, including between native and Relay 1M models.
+  if (!enableGatewayDiscovery) {
+    env['CLAUDE_CODE_MAX_CONTEXT_TOKENS'] = String(resolveContextWindow(bareModel, contextWindow));
+  }
+  if (enableGatewayDiscovery) {
+    delete env['CLAUDE_CODE_MAX_CONTEXT_TOKENS'];
+    env['CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY'] = '1';
+  }
+  applyClaudeCodeThirdPartyCompat(env);
+  return env;
+}
+
+/** Child env for Antigravity — only CLOUD_CODE_URL, no Anthropic proxy vars. */
+export function buildAntigravityChildEnv(gatewayUrl: string): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const name of CONFLICTING_ENV_VARS) {
+    delete env[name];
+  }
+  env['CLOUD_CODE_URL'] = gatewayUrl;
+
+  // Inject dummy API keys to bypass agy's slow keychain lookup (~500ms).
+  // This prevents the race condition where loadCodeAssist fails and falls back
+  // to the hardcoded, unsupported FLASH_LITE model.
+  // The local Cloud Code Gateway ignores these keys, so any dummy value works.
+  env['ANTIGRAVITY_API_KEY'] = 'relay-dummy-key';
+  env['GEMINI_API_KEY'] = 'relay-dummy-key';
+  env['GOOGLE_API_KEY'] = 'relay-dummy-key';
+  env['GOOGLE_GEMINI_API_KEY'] = 'relay-dummy-key';
+
+  return env;
+}
+
+/** Classify a keyring error into a human-readable reason (never throws). */
+export function classifyKeyringError(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  const lower = msg.toLowerCase();
+  if (lower.includes('cannot find module') || lower.includes('module not found') || lower.includes('failed to load')) {
+    return 'native keyring module not available on this system';
+  }
+  if (lower.includes('secret service') || lower.includes('dbus') || lower.includes('daemon')) {
+    return 'Secret Service daemon is not running (start GNOME Keyring or KWallet)';
+  }
+  if (lower.includes('denied') || lower.includes('locked') || lower.includes('cancelled') || lower.includes('user refused')) {
+    return 'keychain access was denied or the keychain is locked';
+  }
+  if (lower.includes('passage')) {
+    return 'passage store unavailable — check PASSAGE_IDENTITIES_FILE and `passage list`';
+  }
+  return `keyring error: ${msg}`;
+}
+
+const KEYRING_SERVICE = 'relay-ai';
+/** @deprecated Use GLOBAL_OPENCODE_KEYRING_ACCOUNT — kept for migration reads */
+const KEYRING_ACCOUNT = 'relay-ai';
+// Windows Credential Manager caps a single credential blob at 2560 bytes (CredWriteW).
+// keyring-rs encodes the password as UTF-16 (2 bytes/char) before that check, so the
+// usable limit is 2560 / 2 = 1280 chars — long OAuth tokens (e.g. OpenAI's JWTs) exceed
+// this, so secrets above the threshold are split across multiple keyring entries.
+// Harmless on macOS/Linux, which have no such limit.
+const KEYRING_CHUNK_PREFIX = '__relay_chunked__:';
+const KEYRING_CHUNK_SIZE = 1200;
+const LEGACY_KEYRING_SERVICE = 'opencode-starter';
+const LEGACY_KEYRING_ACCOUNT = 'opencode-starter';
+
+export const GLOBAL_OPENCODE_KEYRING_ACCOUNT = 'global:opencode';
+
+export function providerKeyringAccount(providerId: string): string {
+  return `provider:${providerId}`;
+}
+
+/** Auth-ref used for a user-managed Relay override of the shared OpenCode catalog key. */
+export function preferredRelayCredentialAuthRef(providerId: string, fallbackAuthRef: string): string {
+  return providerId === 'go' || providerId === 'zen'
+    ? `keyring:${providerKeyringAccount('opencode')}`
+    : fallbackAuthRef;
+}
+
+export function oauthProviderKeyringAccount(providerId: string): string {
+  return `oauth:provider:${providerId}`;
+}
+
+function oauthProviderIdFromAccount(account: string): string | null {
+  const prefix = 'oauth:provider:';
+  return account.startsWith(prefix) ? account.slice(prefix.length) : null;
+}
+
+const oauthRefreshInflight = new Map<string, Promise<string | null>>();
+
+export type ParsedAuthRef =
+  | { kind: 'keyring'; account: string }
+  | { kind: 'env'; varName: string };
+
+/** Parse registry authRef strings like `keyring:provider:groq` or `env:OPENCODE_API_KEY`. */
+export function parseAuthRef(authRef: string): ParsedAuthRef | null {
+  if (authRef.startsWith('keyring:')) {
+    const account = authRef.slice('keyring:'.length);
+    return account ? { kind: 'keyring', account } : null;
+  }
+  if (authRef.startsWith('env:')) {
+    const varName = authRef.slice('env:'.length);
+    return varName ? { kind: 'env', varName } : null;
+  }
+  return null;
+}
+
+/** Env var name for relay-ai namespaced per-provider keys. */
+export function relayAiKeyEnvVar(providerId: string): string {
+  return `RELAY_AI_KEY_${providerId.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
+}
+
+function readEnvCredential(varName: string): string | null {
+  const raw = process.env[varName];
+  if (!raw?.trim()) return null;
+  return raw.trim().split(/\r?\n/)[0]?.trim() || null;
+}
+
+/**
+ * Process-scoped memo for OS-keychain reads.
+ *
+ * macOS prompts for keychain access on every read unless the calling binary was
+ * granted "Always Allow" on that item, and one credential resolution reads the
+ * same account up to three times (access token, account id, provider data) —
+ * a multi-provider sweep otherwise turns into dozens of prompts. Only the
+ * keychain lookup is memoized (the secrets.json fallback stays uncached, so
+ * file-based stores keep their exact semantics); every write or delete drops
+ * the entry (at start and completion) so a rotated OAuth token or a freshly
+ * saved key is never served stale, and a read that raced a write cannot leave
+ * its old value cached.
+ */
+const osKeyringReadCache = new Map<string, Promise<string | null>>();
+
+export function invalidateKeyringReadCache(account?: string): void {
+  if (account === undefined) osKeyringReadCache.clear();
+  else osKeyringReadCache.delete(account);
+}
+
+async function readOsKeyringAccount(account: string, diag?: (msg: string) => void): Promise<string | null> {
+  const cached = osKeyringReadCache.get(account);
+  if (cached) return cached;
+  const read = (async (): Promise<string | null> => {
+    try {
+      const { openEntry } = await import("./secrets-backend.js");
+      const entry = await openEntry(KEYRING_SERVICE, account);
+      if (!entry) return null;
+      const value = (await entry.getPassword()) ?? null;
+      if (!value?.startsWith(KEYRING_CHUNK_PREFIX)) return value;
+      const chunkCount = Number(value.slice(KEYRING_CHUNK_PREFIX.length));
+      let combined = "";
+      for (let i = 0; i < chunkCount; i++) {
+        const chunk = await openEntry(KEYRING_SERVICE, `${account}::chunk::${i}`);
+        combined += (await chunk?.getPassword()) ?? "";
+      }
+      return combined;
+    } catch (err) {
+      diag?.(classifyKeyringError(err));
+      return null;
+    }
+  })();
+  osKeyringReadCache.set(account, read);
+  return read;
+}
+
+async function writeOsKeyringAccount(
+  account: string,
+  key: string,
+  diag?: (msg: string) => void,
+): Promise<boolean> {
+  try {
+    const { openEntry } = await import("./secrets-backend.js");
+    const entry = await openEntry(KEYRING_SERVICE, account);
+    if (!entry) return false;
+    if (key.length <= KEYRING_CHUNK_SIZE) {
+      await entry.setPassword(key);
+      return true;
+    }
+    const chunkCount = Math.ceil(key.length / KEYRING_CHUNK_SIZE);
+    for (let i = 0; i < chunkCount; i++) {
+      const chunk = key.slice(i * KEYRING_CHUNK_SIZE, (i + 1) * KEYRING_CHUNK_SIZE);
+      const chunkEntry = await openEntry(KEYRING_SERVICE, `${account}::chunk::${i}`);
+      if (!chunkEntry) return false;
+      await chunkEntry.setPassword(chunk);
+    }
+    await entry.setPassword(`${KEYRING_CHUNK_PREFIX}${chunkCount}`);
+    return true;
+  } catch (err) {
+    diag?.(classifyKeyringError(err));
+    return false;
+  }
+}
+
+async function deleteOsKeyringAccount(account: string, diag?: (msg: string) => void): Promise<boolean> {
+  try {
+    const { openEntry } = await import("./secrets-backend.js");
+    const entry = await openEntry(KEYRING_SERVICE, account);
+    if (!entry) return false;
+    const value = await entry.getPassword();
+    if (value?.startsWith(KEYRING_CHUNK_PREFIX)) {
+      const chunkCount = Number(value.slice(KEYRING_CHUNK_PREFIX.length));
+      for (let i = 0; i < chunkCount; i++) {
+        const chunkEntry = await openEntry(KEYRING_SERVICE, `${account}::chunk::${i}`);
+        await chunkEntry?.deletePassword();
+      }
+    }
+    await entry.deletePassword();
+    return true;
+  } catch (err) {
+    diag?.(classifyKeyringError(err));
+    return false;
+  }
+}
+
+/** OS keyring first, then ~/.relay-ai/secrets.json (Docker / headless). */
+async function readKeyringAccount(account: string, diag?: (msg: string) => void): Promise<string | null> {
+  const fromOs = await readOsKeyringAccount(account, diag);
+  if (fromOs) return fromOs;
+  return readFileAccount(account);
+}
+
+/** Prefer OS keyring; fall back to secrets.json when keyring is unavailable. */
+async function writeKeyringAccount(
+  account: string,
+  key: string,
+  diag?: (msg: string) => void,
+): Promise<boolean> {
+  invalidateKeyringReadCache(account);
+  try {
+    if (await writeOsKeyringAccount(account, key, diag)) {
+      deleteFileAccount(account);
+      return true;
+    }
+    if (writeFileAccount(account, key)) {
+      diag?.('OS keyring unavailable — saved to secrets.json under RELAY_AI_HOME');
+      return true;
+    }
+    return false;
+  } finally {
+    invalidateKeyringReadCache(account);
+  }
+}
+
+async function deleteKeyringAccount(account: string, diag?: (msg: string) => void): Promise<boolean> {
+  invalidateKeyringReadCache(account);
+  try {
+    const osOk = await deleteOsKeyringAccount(account, diag);
+    const fileOk = deleteFileAccount(account);
+    return osOk || fileOk;
+  } finally {
+    invalidateKeyringReadCache(account);
+  }
+}
+
+/** Read Zen/Go API key: env → global:opencode → legacy relay-ai → opencode-starter. */
+export async function readGlobalOpencodeCredential(diag?: (msg: string) => void): Promise<string | null> {
+  const fromEnv = resolveApiKey();
+  if (fromEnv) return fromEnv;
+
+  const global = await readKeyringAccount(GLOBAL_OPENCODE_KEYRING_ACCOUNT, diag);
+  if (global) return global;
+
+  const current = await readKeyringAccount(KEYRING_ACCOUNT, diag);
+  if (current) return current;
+
+  try {
+    const { openEntry } = await import("./secrets-backend.js");
+    const legacy = await openEntry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT);
+    return (await legacy?.getPassword()) ?? null;
+  } catch (err) {
+    diag?.(classifyKeyringError(err));
+    return null;
+  }
+}
+
+/** Read a stored credential without environment-variable precedence. */
+export async function readStoredProviderCredential(
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<string | null> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring') return null;
+  return readProviderSecret(parsed.account, diag);
+}
+
+/**
+ * Migrate legacy keychain entries to `global:opencode`.
+ * Protocol: read → write → verify → delete old (only after verify succeeds).
+ */
+export async function migrateGlobalOpencodeCredential(diag?: (msg: string) => void): Promise<boolean> {
+  const existing = await readKeyringAccount(GLOBAL_OPENCODE_KEYRING_ACCOUNT, diag);
+  if (existing) return true;
+
+  const legacy =
+    (await readKeyringAccount(KEYRING_ACCOUNT, diag)) ??
+    (await (async () => {
+      try {
+        const { openEntry } = await import("./secrets-backend.js");
+        const legacy = await openEntry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT);
+        return (await legacy?.getPassword()) ?? null;
+      } catch (err) {
+        diag?.(classifyKeyringError(err));
+        return null;
+      }
+    })());
+
+  if (!legacy) return false;
+
+  const wrote = await writeKeyringAccount(GLOBAL_OPENCODE_KEYRING_ACCOUNT, legacy, diag);
+  if (!wrote) return false;
+
+  const verified = await readKeyringAccount(GLOBAL_OPENCODE_KEYRING_ACCOUNT, diag);
+  if (verified !== legacy) {
+    diag?.('credential migration verification failed — keeping legacy keychain entries');
+    return false;
+  }
+
+  if (await readKeyringAccount(KEYRING_ACCOUNT, diag)) {
+    await deleteKeyringAccount(KEYRING_ACCOUNT, diag);
+  }
+  try {
+    const { openEntry } = await import("./secrets-backend.js");
+    const legacy = await openEntry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT);
+    if (await legacy?.getPassword()) {
+      await legacy?.deletePassword();
+    }
+  } catch {
+    // best-effort legacy cleanup
+  }
+  return true;
+}
+
+/** Resolve a provider secret from authRef (env → keyring). */
+export async function resolveProviderCredential(
+  providerId: string,
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<string | null> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed) return null;
+
+  // A key explicitly saved in Relay for the shared OpenCode catalog is a deliberate
+  // override. It must win over OPENCODE_API_KEY, RELAY_AI_KEY_GO/ ZEN, and OpenCode's
+  // own global key so a user can actually replace a stale credential.
+  if (parsed.kind === 'keyring' && parsed.account === GLOBAL_OPENCODE_KEYRING_ACCOUNT) {
+    const relayOverride = await readProviderSecret(providerKeyringAccount('opencode'), diag);
+    if (relayOverride) return relayOverride;
+  }
+
+  const namespaced = readEnvCredential(relayAiKeyEnvVar(providerId));
+  if (namespaced) return namespaced;
+
+  if (parsed.kind === 'env') {
+    return readEnvCredential(parsed.varName);
+  }
+
+  if (parsed.account === GLOBAL_OPENCODE_KEYRING_ACCOUNT) {
+    return readGlobalOpencodeCredential(diag);
+  }
+
+  return readProviderSecret(parsed.account, diag);
+}
+
+/**
+ * Force-refresh a stored OAuth credential after an upstream 401.
+ * Normal resolution refreshes only when expiry metadata says it is needed;
+ * providers can revoke a token early, so the retry path must bypass that gate.
+ */
+export async function forceRefreshProviderCredential(
+  providerId: string,
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<string | null> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring') {
+    return resolveProviderCredential(providerId, authRef, diag);
+  }
+
+  if (parsed.account === GLOBAL_OPENCODE_KEYRING_ACCOUNT) {
+    const relayOverride = await readProviderSecret(providerKeyringAccount('opencode'), diag);
+    if (relayOverride) return relayOverride;
+  }
+
+  const namespaced = readEnvCredential(relayAiKeyEnvVar(providerId));
+  if (namespaced) return namespaced;
+
+  const oauthProviderId = oauthProviderIdFromAccount(parsed.account);
+  const raw = await readKeyringAccount(parsed.account, diag);
+  if (!raw || !oauthProviderId) return decodeProviderSecret(raw);
+  return refreshOAuthKeyringAccount(parsed.account, oauthProviderId, raw, diag, true);
+}
+
+/** Read OAuth metadata retained alongside the access token. */
+export async function resolveProviderOAuthAccountId(
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<string | undefined> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring' || !oauthProviderIdFromAccount(parsed.account)) return undefined;
+  const raw = await readKeyringAccount(parsed.account, diag);
+  return parseStoredOAuthCredential(raw)?.accountId;
+}
+
+export async function resolveProviderOAuthProviderData(
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<Record<string, unknown> | undefined> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring' || !oauthProviderIdFromAccount(parsed.account)) return undefined;
+  const raw = await readKeyringAccount(parsed.account, diag);
+  return parseStoredOAuthCredential(raw)?.providerData;
+}
+
+/** Backfill Copilot plan metadata for credentials saved before plan detection existed. */
+export async function enrichGithubCopilotOAuthProviderData(
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<Record<string, unknown> | undefined> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring' || oauthProviderIdFromAccount(parsed.account) !== 'github-copilot') {
+    return undefined;
+  }
+  const raw = await readKeyringAccount(parsed.account, diag);
+  const credential = parseStoredOAuthCredential(raw);
+  if (!credential?.refresh) return credential?.providerData;
+  try {
+    const summary = await fetchCopilotAccount(credential.refresh);
+    const providerData = { ...credential.providerData, copilot: summary };
+    await writeKeyringAccount(
+      parsed.account,
+      oauthCredentialToKeychainJson({ ...credential, providerData }),
+      diag,
+    );
+    return providerData;
+  } catch (err) {
+    diag?.(`GitHub Copilot plan lookup unavailable — ${err instanceof Error ? err.message : String(err)}`);
+    return credential.providerData;
+  }
+}
+
+function decodeProviderSecret(raw: string | null): string | null {
+  if (!raw) return null;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) return trimmed;
+  const oauth = parseStoredOAuthCredential(trimmed);
+  if (oauth) return oauth.access;
+  try {
+    const parsed = JSON.parse(trimmed) as { type?: string; access?: string; token?: string };
+    if (parsed.type === 'oauth' && typeof parsed.access === 'string') return parsed.access;
+    if (parsed.type === 'wellknown' && typeof parsed.token === 'string') return parsed.token;
+  } catch {
+    // fall through
+  }
+  return trimmed;
+}
+
+async function refreshOAuthKeyringAccount(
+  account: string,
+  providerId: string,
+  raw: string,
+  diag?: (msg: string) => void,
+  force = false,
+): Promise<string | null> {
+  const existing = oauthRefreshInflight.get(account);
+  if (existing) return existing;
+
+  const work = (async (): Promise<string | null> => {
+    const cred = parseStoredOAuthCredential(raw);
+    if (!cred || (!force && !oauthCredentialShouldRefresh(cred, providerId))) {
+      return decodeProviderSecret(raw);
+    }
+    try {
+      const refreshed = await refreshStoredOAuthCredential(providerId, cred);
+      const json = oauthCredentialToKeychainJson(refreshed);
+      await writeKeyringAccount(account, json, diag);
+      return refreshed.access;
+    } catch (err) {
+      diag?.(err instanceof Error ? err.message : String(err));
+      if (cred.access && cred.expires > Date.now()) return cred.access;
+      throw err;
+    }
+  })();
+
+  oauthRefreshInflight.set(account, work);
+  try {
+    return await work;
+  } finally {
+    oauthRefreshInflight.delete(account);
+  }
+}
+
+async function readProviderSecret(account: string, diag?: (msg: string) => void): Promise<string | null> {
+  const raw = await readKeyringAccount(account, diag);
+  if (!raw) return null;
+
+  const oauthProviderId = oauthProviderIdFromAccount(account);
+  if (oauthProviderId && raw.trim().startsWith('{')) {
+    return refreshOAuthKeyringAccount(account, oauthProviderId, raw, diag);
+  }
+  return decodeProviderSecret(raw);
+}
+
+export async function saveProviderCredential(
+  authRef: string,
+  key: string,
+  diag?: (msg: string) => void,
+): Promise<boolean> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring') return false;
+  return writeKeyringAccount(parsed.account, key, diag);
+}
+
+/** Delete a provider secret from keyring (no-op for env: refs). */
+export async function deleteProviderCredential(
+  authRef: string,
+  diag?: (msg: string) => void,
+): Promise<boolean> {
+  const parsed = parseAuthRef(authRef);
+  if (!parsed || parsed.kind !== 'keyring') return false;
+  return deleteKeyringAccount(parsed.account, diag);
+}
+
+export async function readFromCredentialStore(diag?: (msg: string) => void): Promise<string | null> {
+  return readGlobalOpencodeCredential(diag);
+}
+
+export async function saveToCredentialStore(key: string, diag?: (msg: string) => void): Promise<boolean> {
+  const wrote = await writeKeyringAccount(GLOBAL_OPENCODE_KEYRING_ACCOUNT, key, diag);
+  if (wrote) {
+    await deleteKeyringAccount(KEYRING_ACCOUNT, diag);
+  }
+  return wrote;
+}
+
+export async function isSecretServiceAvailable(): Promise<boolean> {
+  try {
+    const { isSecretStoreAvailable } = await import("./secrets-backend.js");
+    return await isSecretStoreAvailable();
+  } catch {
+    return false;
+  }
+}

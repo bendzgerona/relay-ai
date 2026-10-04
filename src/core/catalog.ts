@@ -1,0 +1,134 @@
+// src/core/catalog.ts — credential-free model catalog for embedded consumers.
+
+import { loadPreferences } from '../config.js';
+import { getReasoningCapabilities } from '../provider-factory.js';
+import { resolveModelReasoningMetadata } from '../registry/models-dev.js';
+import { loadRegistry } from '../registry/io.js';
+import { getProviderModels } from '../registry/provider-models.js';
+import { resolveProviderTemplate } from '../registry/resolve-template.js';
+import { REGISTRY_SCHEMA_VERSION, type CachedModel, type ProviderRegistry, type RegistryProvider } from '../registry/types.js';
+import { RelayCoreError } from './errors.js';
+import { isRelayReasoningLevel, reasoningNpmForRoute } from './reasoning.js';
+import { toRelayRouteId } from './route-id.js';
+import type { RelayModelDescriptor } from './types.js';
+
+/** Read the registry without ever persisting migrations, and reject newer schemas. */
+export function loadCoreRegistry(path?: string): ProviderRegistry {
+  const registry = loadRegistry(path, { persist: false });
+  if (registry.schemaVersion > REGISTRY_SCHEMA_VERSION) {
+    throw new RelayCoreError(
+      'UNSUPPORTED_REGISTRY_VERSION',
+      `Registry schema v${registry.schemaVersion} is newer than supported v${REGISTRY_SCHEMA_VERSION} — upgrade relay-ai.`,
+    );
+  }
+  return registry;
+}
+
+type ReasoningInfo = RelayModelDescriptor['capabilities'];
+
+function mapReasoning(provider: RegistryProvider, model: CachedModel): ReasoningInfo {
+  const base = { tools: 'unknown' as const, vision: 'unknown' as const };
+  // Must be the SDK package the model is actually *built* with, not the
+  // provider's registry npm — Cloud Code routes are registered as
+  // openai-compatible but served by @ai-sdk/google, so classifying by the
+  // registry value reported reasoning capabilities Core does not agree with.
+  const npm = reasoningNpmForRoute(provider, model);
+  const upstreamModelId = model.upstreamModelId ?? model.id;
+  try {
+    const caps = getReasoningCapabilities(npm, upstreamModelId, {
+      providerId: provider.id,
+      apiBaseUrl: model.apiUrl ?? provider.api.url,
+      supportedParameters: model.supportedParameters,
+      // Shared with the Codex materializer so Core can't diverge on reasoning/
+      // interleaved/effort. Effort resolves on the catalog id (models.dev's key).
+      ...resolveModelReasoningMetadata(provider.id, model.id, {
+        reasoning: model.reasoning,
+        interleavedField: model.interleavedReasoningField,
+      }),
+      upstreamModelId,
+    });
+    switch (caps.mode) {
+      case 'none':
+        return { ...base, reasoning: 'none' };
+      case 'internal-only':
+        return { ...base, reasoning: 'fixed' };
+      case 'controllable': {
+        // `ReasoningCapabilities.levels` is the internal `string[]`; narrow it
+        // so the public descriptor only ever exposes real RelayReasoningLevels.
+        const levels = caps.levels.filter(isRelayReasoningLevel);
+        if (levels.length === 0) return { ...base, reasoning: 'fixed' };
+        return {
+          ...base,
+          reasoning: 'adjustable',
+          reasoningLevels: levels,
+          ...(isRelayReasoningLevel(caps.defaultLevel)
+            ? { defaultReasoningLevel: caps.defaultLevel }
+            : {}),
+        };
+      }
+      default:
+        return { ...base, reasoning: 'unknown' };
+    }
+  } catch {
+    // Reasoning classification is best-effort; never fail the catalog over it.
+    return { ...base, reasoning: 'unknown' };
+  }
+}
+
+function favoriteKey(providerId: string, modelId: string): string {
+  return `${providerId}::${modelId}`;
+}
+
+function toDescriptor(provider: RegistryProvider, model: CachedModel, favorites: Set<string>): RelayModelDescriptor {
+  const upstreamModelId = model.upstreamModelId ?? model.id;
+  const providerShortName = resolveProviderTemplate(provider)?.shortName ?? provider.name;
+  return {
+    routeId: toRelayRouteId(provider.id, model.id),
+    providerId: provider.id,
+    providerName: provider.name,
+    providerShortName,
+    modelId: model.id,
+    upstreamModelId,
+    displayName: model.name,
+    authType: provider.authType ?? 'api',
+    favorite: favorites.has(favoriteKey(provider.id, model.id)),
+    ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+    ...(model.cost
+      ? {
+          pricing: {
+            input: model.cost.input,
+            output: model.cost.output,
+            ...(model.cost.cache_read !== undefined ? { cacheRead: model.cost.cache_read } : {}),
+            ...(model.cost.cache_write !== undefined ? { cacheWrite: model.cost.cache_write } : {}),
+          },
+        }
+      : {}),
+    capabilities: mapReasoning(provider, model),
+  };
+}
+
+/**
+ * List the credential-free model catalog: one descriptor per cached model of
+ * every enabled provider. Never resolves credentials, refreshes OAuth, hits a
+ * provider API, or writes to disk.
+ */
+export function listRelayModels(registryPath?: string): RelayModelDescriptor[] {
+  const registry = loadCoreRegistry(registryPath);
+  const favorites = new Set(
+    (loadPreferences().favoriteModels ?? []).map(f => favoriteKey(f.providerId, f.modelId)),
+  );
+
+  const descriptors: RelayModelDescriptor[] = [];
+  for (const provider of registry.providers) {
+    if (!provider.enabled) continue;
+    for (const model of getProviderModels(provider)) {
+      descriptors.push(toDescriptor(provider, model, favorites));
+    }
+  }
+
+  return descriptors.sort((a, b) =>
+    Number(b.favorite) - Number(a.favorite)
+    || a.providerName.localeCompare(b.providerName)
+    || a.displayName.localeCompare(b.displayName),
+  );
+}

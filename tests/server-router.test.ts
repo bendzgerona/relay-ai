@@ -1,0 +1,689 @@
+import { createServer, type Server } from 'node:http';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { createGatewayModelCatalog, gatewayModelIdentity, type ServerModelInfo } from '../src/server/models.js';
+import { startServer, type ServerHandle } from '../src/server/router.js';
+import { createLanguageModel } from '../src/provider-factory.js';
+import { generateAnthropicResponse } from '../src/sdk-adapter.js';
+import { appendSubagentRouteMarker } from '../src/subagent-route-registry.js';
+
+vi.mock('../src/provider-factory.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/provider-factory.js')>();
+  return {
+    ...actual,
+    createLanguageModel: vi.fn(async (spec: unknown) => ({ spec })),
+  };
+});
+
+vi.mock('../src/sdk-adapter.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/sdk-adapter.js')>();
+  return {
+    ...actual,
+    generateAnthropicResponse: vi.fn(async (_model: unknown, _params: unknown, modelId: string) => ({
+      id: 'msg-test',
+      type: 'message',
+      role: 'assistant',
+      model: modelId,
+      content: [{ type: 'text', text: 'sdk ok' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    })),
+  };
+});
+
+vi.mock('../src/openai-adapter.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../src/openai-adapter.js')>();
+  return {
+    ...actual,
+    generateOpenAiResponse: vi.fn(async (_model: unknown, _params: unknown, modelId: string) => ({
+      id: 'chatcmpl-test',
+      object: 'chat.completion',
+      model: modelId,
+      choices: [{ message: { content: 'openai sdk ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    })),
+  };
+});
+
+interface UpstreamRequest {
+  method: string;
+  url: string;
+  authorization: string | undefined;
+  body: any;
+}
+
+async function readRequestBody(req: Parameters<typeof createServer>[0] extends (req: infer R, res: any) => any ? R : never): Promise<any> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  const raw = Buffer.concat(chunks).toString();
+  return raw ? JSON.parse(raw) : null;
+}
+
+async function startUpstream(responseBody: any): Promise<{ baseUrl: string; requests: UpstreamRequest[]; close: () => Promise<void> }> {
+  const requests: UpstreamRequest[] = [];
+  const server = createServer(async (req, res) => {
+    requests.push({
+      method: req.method ?? '',
+      url: req.url ?? '',
+      authorization: Array.isArray(req.headers.authorization)
+        ? req.headers.authorization[0]
+        : req.headers.authorization,
+      body: await readRequestBody(req),
+    });
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(responseBody));
+  });
+
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('missing upstream address');
+
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    requests,
+    close: () => new Promise<void>((resolve, reject) => server.close(err => (err ? reject(err) : resolve()))),
+  };
+}
+
+const catalog = createGatewayModelCatalog([
+  model('claude-native', 'anthropic', 'zen'),
+  model('openai-format', 'openai', 'go'),
+  model('bad-format', 'unsupported', 'zen'),
+]);
+
+const handles: Array<ServerHandle | { close: () => Promise<void> }> = [];
+
+function model(
+  id: string,
+  modelFormat: ServerModelInfo['modelFormat'],
+  sourceBackend: ServerModelInfo['sourceBackend'],
+): ServerModelInfo {
+  return {
+    id,
+    name: id,
+    isFree: false,
+    brand: 'Other',
+    sourceBackend,
+    modelFormat,
+  };
+}
+
+async function startTestServer(options: Partial<Parameters<typeof startServer>[0]> = {}): Promise<ServerHandle> {
+  const upstream = await startUpstream({
+    id: 'chatcmpl-test',
+    choices: [{ message: { content: 'upstream ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 5, completion_tokens: 7 },
+  });
+  handles.push(upstream);
+
+  const handle = await startServer({
+    host: '127.0.0.1',
+    port: 0,
+    apiKey: 'real-opencode-key',
+    serverPassword: null,
+    catalog,
+    backends: {
+      zen: { baseUrl: upstream.baseUrl },
+      go: { baseUrl: upstream.baseUrl },
+    },
+    ...options,
+  });
+  handles.push(handle);
+  return handle;
+}
+
+async function closeHandle(handle: ServerHandle | { close: () => Promise<void> }): Promise<void> {
+  await handle.close();
+}
+
+afterEach(async () => {
+  vi.mocked(createLanguageModel).mockClear();
+  while (handles.length > 0) {
+    const handle = handles.pop();
+    if (handle) await closeHandle(handle);
+  }
+});
+
+describe('server router', () => {
+  it('serves health and model list endpoints', async () => {
+    const server = await startTestServer();
+
+    const health = await fetch(`${server.url}/health`);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toEqual({ ok: true });
+
+    const models = await fetch(`${server.url}/models`);
+    expect(models.status).toBe(200);
+    expect(await models.json()).toEqual({
+      models: expect.arrayContaining([
+        expect.objectContaining({ id: 'claude-native' }),
+        expect.objectContaining({ id: 'openai-format' }),
+      ]),
+    });
+
+    const anthropic = await fetch(`${server.url}/anthropic/v1/models`);
+    expect(anthropic.status).toBe(200);
+    expect(await anthropic.json()).toMatchObject({
+      data: expect.arrayContaining([
+        expect.objectContaining({ id: 'claude-native' }),
+        expect.objectContaining({ id: 'anthropic-go__openai-format' }),
+      ]),
+    });
+
+    const openai = await fetch(`${server.url}/openai/v1/models`);
+    expect(openai.status).toBe(200);
+    expect(await openai.json()).toMatchObject({ object: 'list' });
+  });
+
+  it('returns 401 for protected endpoints when password is missing or wrong', async () => {
+    const server = await startTestServer({ serverPassword: 'secret' });
+
+    const missing = await fetch(`${server.url}/openai/v1/models`);
+    expect(missing.status).toBe(401);
+    expect(await missing.json()).toMatchObject({ error: { message: 'Unauthorized' } });
+
+    const wrong = await fetch(`${server.url}/openai/v1/models`, {
+      headers: { authorization: 'Bearer wrong' },
+    });
+    expect(wrong.status).toBe(401);
+
+    const right = await fetch(`${server.url}/openai/v1/models`, {
+      headers: { 'x-api-key': 'secret' },
+    });
+    expect(right.status).toBe(200);
+  });
+
+  it('forwards Anthropic-native messages to the backend v1/messages endpoint with the real API key', async () => {
+    const upstream = await startUpstream({
+      id: 'msg-test',
+      type: 'message',
+      role: 'assistant',
+      content: [{ type: 'text', text: 'native ok' }],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      backends: {
+        zen: { baseUrl: upstream.baseUrl },
+        go: { baseUrl: upstream.baseUrl },
+      },
+    });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-native', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ id: 'msg-test' });
+    expect(upstream.requests).toHaveLength(1);
+    expect(upstream.requests[0]).toMatchObject({
+      method: 'POST',
+      url: '/v1/messages',
+      authorization: 'Bearer real-opencode-key',
+      body: { model: 'claude-native', messages: [{ role: 'user', content: 'hi' }] },
+    });
+  });
+
+  // OpenAI-format Anthropic translation now routes through the Vercel AI SDK adapter
+  // (createLanguageModel + streamAnthropicResponse/generateAnthropicResponse), which
+  // requires an SDK `npm` on the model. Translation correctness is covered by
+  // sdk-adapter.test.ts (and was validated against live providers). Here we only
+  // assert the router's guard: an OpenAI-format model with no SDK provider is rejected.
+  it('rejects Anthropic messages for OpenAI-format models without an SDK provider', async () => {
+    const server = await startTestServer();
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'openai-format',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { message: expect.stringContaining('No SDK provider') },
+    });
+  });
+
+  it('streams behind the scenes for ChatGPT-login models when the client asks for a non-streaming reply', async () => {
+    const chatgpt: ServerModelInfo = {
+      ...model('gpt-6-sol', 'openai', 'openai-oauth'),
+      providerId: 'openai-oauth',
+      npm: '@ai-sdk/openai',
+      authType: 'oauth',
+    };
+    const apiKeyed: ServerModelInfo = { ...chatgpt, id: 'gpt-6-luna', providerId: 'openai', authType: 'api' };
+    const server = await startTestServer({ catalog: createGatewayModelCatalog([chatgpt, apiKeyed]) });
+
+    for (const id of ['gpt-6-sol', 'gpt-6-luna']) {
+      const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: id, max_tokens: 1, messages: [{ role: 'user', content: 'ping' }] }),
+      });
+      expect(response.status).toBe(200);
+    }
+
+    const calls = vi.mocked(generateAnthropicResponse).mock.calls.slice(-2);
+    expect(calls[0]![3]).toMatchObject({ forceStream: true });
+    expect(calls[1]![3]).toMatchObject({ forceStream: false });
+  });
+
+  it('passes masked request-local catalog routing to SDK-backed partner requests', async () => {
+    const qwen: ServerModelInfo = {
+      ...model('qwen-3', 'openai', 'go'),
+      name: 'Qwen 3',
+      providerId: 'go',
+      npm: '@ai-sdk/alibaba',
+    };
+    const grok: ServerModelInfo = {
+      ...model('grok-4', 'openai', 'go'),
+      name: 'Grok 4',
+      providerId: 'xai',
+      npm: '@ai-sdk/xai',
+    };
+    const serverModels = [qwen, grok];
+    const gateway = { maskGatewayIds: true };
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog(serverModels, gateway),
+      gateway,
+    });
+    const qwenId = gatewayModelIdentity(qwen, serverModels, gateway).publicId;
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-claude-code-session-id': 'session-qwen',
+      },
+      body: JSON.stringify({
+        model: qwenId,
+        messages: [{ role: 'user', content: 'delegate' }],
+        tools: [claudeAgentDefinition()],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const params = vi.mocked(generateAnthropicResponse).mock.calls.at(-1)?.[1] as any;
+    expect(params.headers).toMatchObject({
+      'x-opencode-session': 'session-qwen',
+      'User-Agent': expect.stringMatching(/^relay-ai\//),
+    });
+    expect(params.subagentRouting.parentModelId).toBe(qwenId);
+    expect(params.subagentRouting.models).toHaveLength(2);
+    expect(params.subagentRouting.models[0].id).toBe(qwenId);
+    expect(params.subagentRouting.registerSubagentRoute).toBeTypeOf('function');
+
+    const grokId = gatewayModelIdentity(grok, serverModels, gateway).publicId;
+    const token = params.subagentRouting.registerSubagentRoute(grokId);
+    const childResponse = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-claude-code-session-id': 'session-qwen',
+        'x-claude-code-agent-id': 'agent-grok',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-5',
+        messages: [{
+          role: 'user',
+          content: [{
+            type: 'text',
+            text: appendSubagentRouteMarker('Inspect.', token),
+          }],
+        }],
+        tools: [claudeAgentDefinition()],
+      }),
+    });
+
+    expect(childResponse.status).toBe(200);
+    const childParams = vi.mocked(generateAnthropicResponse).mock.calls.at(-1)?.[1] as any;
+    expect(childParams.subagentRouting.parentModelId).toBe(grokId);
+    expect((childParams.messages[0].content as any[])[0].text).toBe('Inspect.');
+  });
+
+  it('forwards OpenAI chat completions for OpenAI-format models unchanged', async () => {
+    const upstream = await startUpstream({
+      id: 'chatcmpl-test',
+      choices: [{ message: { content: 'openai ok' }, finish_reason: 'stop' }],
+    });
+    handles.push(upstream);
+    const server = await startTestServer({
+      backends: {
+        zen: { baseUrl: upstream.baseUrl },
+        go: { baseUrl: upstream.baseUrl },
+      },
+    });
+
+    const body = { model: 'openai-format', messages: [{ role: 'user', content: 'hi' }], temperature: 0.2 };
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ id: 'chatcmpl-test' });
+    expect(upstream.requests[0]).toMatchObject({
+      method: 'POST',
+      url: '/v1/chat/completions',
+      authorization: 'Bearer real-opencode-key',
+      body,
+    });
+  });
+
+  it('rewrites a client-supplied scoped OpenAI id back to the real upstream model id on direct passthrough', async () => {
+    // Regression: when two providers collide on a bare OpenAI id, GET /openai/v1/models
+    // exposes each as `${providerId}/${id}`. A client sending that scoped id back on
+    // /openai/v1/chat/completions must have it rewritten to the real upstream id before
+    // forwarding — otherwise the upstream API (which has never heard of the scoped alias)
+    // rejects the request.
+    const upstream = await startUpstream({
+      id: 'chatcmpl-test',
+      choices: [{ message: { content: 'moonshot ok' }, finish_reason: 'stop' }],
+    });
+    handles.push(upstream);
+    const collidingModel: ServerModelInfo = {
+      id: 'kimi-k3',
+      name: 'Kimi K3',
+      isFree: false,
+      brand: 'Moonshot',
+      providerId: 'moonshot-global',
+      providerLabel: 'Moonshot Global',
+      sourceBackend: 'moonshot-global',
+      modelFormat: 'openai',
+      completionsUrl: `${upstream.baseUrl}/v1/chat/completions`,
+      apiKey: 'moonshot-key',
+    };
+    const goCollision: ServerModelInfo = { ...collidingModel, providerId: 'go', providerLabel: 'OpenCode Go', sourceBackend: 'go' };
+    const server = await startTestServer({ catalog: createGatewayModelCatalog([collidingModel, goCollision]) });
+
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'moonshot-global/kimi-k3', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ id: 'chatcmpl-test' });
+    expect(upstream.requests[0]?.body).toMatchObject({ model: 'kimi-k3' });
+  });
+
+  it('routes a Claude App single-entry 1M discovery id to the bare upstream model', async () => {
+    const upstream = await startUpstream({
+      id: 'msg-upstream',
+      type: 'message',
+      role: 'assistant',
+      model: 'provider-long-model',
+      content: [{ type: 'text', text: 'long context ok' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 1, output_tokens: 1 },
+    });
+    handles.push(upstream);
+    const longModel: ServerModelInfo = {
+      id: 'provider-long-model',
+      name: 'Provider Long Model',
+      isFree: false,
+      brand: 'Provider',
+      providerId: 'provider',
+      providerLabel: 'Provider',
+      sourceBackend: 'provider',
+      modelFormat: 'anthropic',
+      upstreamModelId: 'provider-long-model',
+      baseUrl: upstream.baseUrl,
+      apiKey: 'provider-key',
+      contextWindow: 1_000_000,
+    };
+    const gateway = {
+      maskGatewayIds: true,
+      longContextDisplay: 'single-1m' as const,
+    };
+    const server = await startTestServer({
+      catalog: createGatewayModelCatalog([longModel], gateway),
+      gateway,
+    });
+
+    const discoveryResponse = await fetch(`${server.url}/anthropic/v1/models`);
+    const discovery = await discoveryResponse.json() as {
+      data: Array<{ id: string; supports_1m?: boolean }>;
+    };
+    const discovered = discovery.data[0]!;
+    expect(discovered.id).toMatch(/\[1m\]$/);
+    expect(discovered.supports_1m).toBe(false);
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: discovered.id,
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(upstream.requests[0]?.body).toMatchObject({ model: 'provider-long-model' });
+  });
+
+  it('caches SDK language models per provider-qualified route, not just raw model id', async () => {
+    const duplicateCatalog = createGatewayModelCatalog([
+      {
+        id: 'gpt-4o',
+        name: 'GPT-4o',
+        isFree: false,
+        brand: 'OpenAI',
+        providerId: 'openai',
+        providerLabel: 'OpenAI',
+        sourceBackend: 'openai',
+        modelFormat: 'openai',
+        npm: '@ai-sdk/openai',
+        apiKey: 'openai-key',
+      },
+      {
+        id: 'gpt-4o',
+        name: 'GPT-4o via OpenRouter',
+        isFree: false,
+        brand: 'OpenAI',
+        providerId: 'openrouter',
+        providerLabel: 'OpenRouter',
+        sourceBackend: 'openrouter',
+        modelFormat: 'openai',
+        npm: '@openrouter/ai-sdk-provider',
+        apiKey: 'openrouter-key',
+      },
+    ]);
+    const server = await startTestServer({ catalog: duplicateCatalog });
+
+    for (const modelId of ['anthropic-openai__gpt-4o', 'anthropic-openrouter__gpt-4o']) {
+      const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }] }),
+      });
+      expect(response.status).toBe(200);
+    }
+
+    expect(vi.mocked(createLanguageModel)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(createLanguageModel).mock.calls.map(call => (call[0] as any).providerId)).toEqual([
+      'openai',
+      'openrouter',
+    ]);
+  });
+
+  it('exposes SDK-only registry models through OpenAI chat completions', async () => {
+    const sdkOnlyCatalog = createGatewayModelCatalog([{
+      id: 'gpt-5',
+      name: 'GPT-5',
+      isFree: false,
+      brand: 'OpenAI',
+      providerId: 'openai',
+      providerLabel: 'OpenAI',
+      sourceBackend: 'openai',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai',
+      apiBaseUrl: 'https://api.openai.com/v1',
+      apiKey: 'openai-key',
+    }]);
+    const server = await startTestServer({ catalog: sdkOnlyCatalog });
+
+    const models = await fetch(`${server.url}/openai/v1/models`);
+    expect(models.status).toBe(200);
+    expect(await models.json()).toEqual({
+      object: 'list',
+      data: [
+        expect.objectContaining({ id: 'gpt-5', owned_by: 'openai' }),
+      ],
+    });
+
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-5', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ id: 'chatcmpl-test', choices: [{ message: { content: 'openai sdk ok' } }] });
+  });
+
+  it('translates OpenAI requests for Anthropic-native models', async () => {
+    const server = await startTestServer();
+
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'claude-native', messages: [] }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({ id: 'chatcmpl-test', choices: [{ message: { content: 'openai sdk ok' } }] });
+  });
+
+  it('rejects unsupported model formats', async () => {
+    const server = await startTestServer();
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'bad-format', messages: [] }),
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toMatchObject({
+      error: { message: expect.stringContaining('Unsupported model format') },
+    });
+  });
+});
+
+function claudeAgentDefinition() {
+  return {
+    name: 'Agent',
+    description: 'Launch an agent',
+    input_schema: {
+      type: 'object',
+      properties: {
+        description: { type: 'string' },
+        prompt: { type: 'string' },
+        subagent_type: { type: 'string' },
+        model: { type: 'string' },
+      },
+    },
+  };
+}
+
+describe('dual-protocol gateways keep direct passthrough', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('forwards an Anthropic model on OpenCode Zen without SDK translation', async () => {
+    const realFetch = globalThis.fetch;
+    const upstreamCalls: Array<{ url: string; body: any }> = [];
+    vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (!url.startsWith('https://opencode.ai/')) return realFetch(input, init);
+      upstreamCalls.push({ url, body: JSON.parse(String(init?.body)) });
+      return new Response(JSON.stringify({
+        id: 'msg-zen',
+        type: 'message',
+        role: 'assistant',
+        model: 'claude-opus-5',
+        content: [{ type: 'text', text: 'zen ok' }],
+        stop_reason: 'end_turn',
+        usage: { input_tokens: 1, output_tokens: 1 },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    });
+    const zenClaude: ServerModelInfo = {
+      id: 'claude-opus-5',
+      name: 'Claude Opus 5',
+      isFree: false,
+      brand: 'Anthropic',
+      providerId: 'zen',
+      sourceBackend: 'zen',
+      modelFormat: 'anthropic',
+      npm: '@ai-sdk/anthropic',
+      baseUrl: 'https://opencode.ai/zen',
+      apiBaseUrl: 'https://opencode.ai/zen',
+      apiKey: 'zen-key',
+    };
+    const server = await startTestServer({ catalog: createGatewayModelCatalog([zenClaude]) });
+
+    const response = await fetch(`${server.url}/anthropic/v1/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'claude-opus-5',
+        max_tokens: 16,
+        system: [{ type: 'text', text: 'sys', cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: 'hello' }],
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(createLanguageModel).not.toHaveBeenCalled();
+    expect(upstreamCalls).toHaveLength(1);
+    expect(upstreamCalls[0]!.url).toBe('https://opencode.ai/zen/v1/messages');
+    expect(upstreamCalls[0]!.body).toMatchObject({
+      system: [{ cache_control: { type: 'ephemeral' } }],
+    });
+  });
+
+  it('forwards an OpenCode Go chat request with every OpenAI field intact', async () => {
+    const upstream = await startUpstream({
+      id: 'chatcmpl-test',
+      choices: [{ message: { content: '{"ok":true}' }, finish_reason: 'stop' }],
+    });
+    handles.push(upstream);
+    const goModel: ServerModelInfo = {
+      id: 'deepseek-v4-flash',
+      name: 'DeepSeek V4 Flash',
+      isFree: false,
+      brand: 'DeepSeek',
+      providerId: 'go',
+      sourceBackend: 'go',
+      modelFormat: 'openai',
+      npm: '@ai-sdk/openai-compatible',
+      apiBaseUrl: 'https://opencode.ai/zen/go/v1',
+      completionsUrl: `${upstream.baseUrl}/v1/chat/completions`,
+      apiKey: 'go-key',
+    };
+    const server = await startTestServer({ catalog: createGatewayModelCatalog([goModel]) });
+
+    const response = await fetch(`${server.url}/openai/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'deepseek-v4-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+        response_format: { type: 'json_object' },
+        top_p: 0.5,
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    expect(createLanguageModel).not.toHaveBeenCalled();
+    expect(upstream.requests[0]?.body).toMatchObject({
+      response_format: { type: 'json_object' },
+      top_p: 0.5,
+    });
+  });
+});

@@ -1,0 +1,1268 @@
+import { getSupportedApps, getSupportedApp, getRelayLaunchCommand, detectApp } from '../native-launcher.js';
+import { exec } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execAsync = promisify(exec);
+import { existsSync, statSync } from 'node:fs';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { randomUUID } from 'node:crypto';
+import { loadPreferences, recordLaunchFolder, savePreferences, setAppPathOverride, setServerAutostart } from '../config.js';
+import { fetchProviderCatalog } from '../provider-catalog.js';
+import { providersForCodexSubagents, providersForTarget, type RelayLaunchTarget } from '../target-compatibility.js';
+import { normalizeFavoriteModels } from '../favorites.js';
+import { CODEX_SUBAGENT_MODEL_CAP } from '../constants.js';
+import { favoriteProviderDisplayName } from '../favorite-provider-display.js';
+import {
+  preferredRelayCredentialAuthRef,
+  readStoredProviderCredential,
+  saveProviderCredential,
+  resolveProviderCredential,
+} from '../env.js';
+import { readBody, sendJson } from '../http-utils.js';
+import { loadRegistry } from '../registry/io.js';
+import { getProviderModels, supportsManualModels } from '../registry/provider-models.js';
+import type { ManualModel } from '../registry/types.js';
+import { refreshProviderModels, refreshAllProviderModels } from '../registry/refresh-models.js';
+import { listAddableTemplates, listVisibleOAuthTemplates, PROVIDER_TEMPLATES } from '../provider-templates.js';
+import { addProviderFromTemplate, type AddTemplateResult } from '../registry/add-template.js';
+import {
+  addCustomEndpointProvider,
+  updateCustomEndpointProvider,
+  type CustomEndpointKind,
+} from '../registry/custom-endpoint.js';
+import { validateCustomEndpointUrl } from '../registry/url-security.js';
+import { saveNativeOAuthCredential } from '../registry/provider-auth.js';
+import { removeProviderFromRegistry } from '../registry/crud.js';
+import { requestXaiDeviceCode, pollXaiDeviceCodeToken } from '../oauth/xai.js';
+import { requestOpenAiDeviceCode, pollOpenAiDeviceCodeToken, openAiDeviceCodeUrl } from '../oauth/openai.js';
+import { requestGithubDeviceCode, pollGithubDeviceCodeToken } from '../oauth/github.js';
+import { requestClinePassDeviceCode, pollClinePassDeviceCode } from '../oauth/cline-pass.js';
+import {
+  guiCallbackRedirectUri,
+} from '../oauth/claude-code.js';
+import {
+  buildAntigravityAuthUrl,
+  completeAntigravityExchange,
+} from '../oauth/antigravity-oauth.js';
+import { writeSecureLogLine } from '../trace-log.js';
+import { providerOptionsFromCatalog } from '../server/index.js';
+import { getServerStatus, startGatewayServer, stopGatewayServer, type ServerStartRequest } from './server-control.js';
+import { hostFromHeader } from '../server/advertise-addrs.js';
+import { freeStatusLabel } from '../free-models.js';
+import { checkForUpdates } from '../update-check.js';
+import { supportsClaudeTransparentMode } from '../http-proxy/routes.js';
+import { copilotPlanTier } from '../registry/copilot-models.js';
+
+const MODELS_TIMEOUT_MS = 30_000;
+
+export type UiServerLifecycleEvent =
+  | { type: 'started'; listenMode: 'local' | 'network'; modelCount: number }
+  | { type: 'stopped' };
+
+export interface UiApiOptions {
+  trace?: boolean;
+  traceLogPath?: string;
+  /** When `server`, app launch APIs are disabled (Docker admin UI). */
+  uiMode?: 'full' | 'server';
+  onServerLifecycle?: (event: UiServerLifecycleEvent) => void;
+}
+
+// ── OAuth device-code session store ──────────────────────────────────────────
+// Keyed by random session ID returned to the client. Sessions auto-purge on
+// first terminal status read so the map doesn't grow unboundedly.
+
+type OAuthSessionStatus = 'pending' | 'done' | 'error';
+
+interface OAuthSession {
+  status: OAuthSessionStatus;
+  url: string;
+  userCode?: string;          // device code flows only
+  providerId: string;
+  error?: string;
+  // PKCE flows only — never sent to client:
+  codeVerifier?: string;
+  oauthState?: string;
+  codeResolver?: (code: string) => void;
+  errorRejecter?: (err: string) => void;
+}
+
+const oauthSessions = new Map<string, OAuthSession>();
+
+async function fetchModelsWithTimeout(opts?: Parameters<typeof fetchProviderCatalog>[0]) {
+  const timeout = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('timeout')), MODELS_TIMEOUT_MS),
+  );
+  return Promise.race([fetchProviderCatalog(opts), timeout]);
+}
+
+/** Shared 500/504 mapping for the two provider-catalog-fetching routes below. */
+function sendCatalogFetchError(res: ServerResponse, err: unknown, label: string): void {
+  const isTimeout = String(err).includes('timeout');
+  sendJson(res, isTimeout ? 504 : 500, { error: isTimeout ? `${label} timed out` : String(err) });
+}
+
+function isLoopbackOrigin(origin: string | undefined): boolean {
+  if (!origin) return false;
+  try {
+    const hostname = new URL(origin).hostname;
+    return hostname === '127.0.0.1' || hostname === 'localhost' || hostname === '::1';
+  } catch {
+    return false;
+  }
+}
+
+function sendCors(req: IncomingMessage, res: ServerResponse): void {
+  const origin = req.headers.origin;
+  const originValue = Array.isArray(origin) ? origin[0] : origin;
+  if (isLoopbackOrigin(originValue)) {
+    res.setHeader('Access-Control-Allow-Origin', originValue!);
+  }
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+}
+
+function traceUi(opts: UiApiOptions | undefined, message: string): void {
+  if (!opts?.trace || !opts.traceLogPath) return;
+  writeSecureLogLine(opts.traceLogPath, `${new Date().toISOString()} ${message}`);
+}
+
+function notifyServerLifecycle(opts: UiApiOptions, event: UiServerLifecycleEvent): void {
+  try {
+    opts.onServerLifecycle?.(event);
+  } catch {
+    // Terminal output must not affect the gateway lifecycle or API response.
+  }
+}
+
+export function handleUiApiRequest(req: IncomingMessage, res: ServerResponse, opts: UiApiOptions = {}): void {
+  sendCors(req, res);
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  const url = req.url ?? '';
+  traceUi(opts, `${req.method ?? 'GET'} ${url}`);
+
+  if (url === '/api/config' && req.method === 'GET') {
+    handleGetConfig(res);
+  } else if (url === '/api/update-status' && req.method === 'GET') {
+    handleGetUpdateStatus(res);
+  } else if (url === '/api/config' && req.method === 'POST') {
+    handlePostConfig(req, res);
+  } else if (url.startsWith('/api/models') && req.method === 'GET') {
+    const appId = new URL(url, 'http://localhost').searchParams.get('appId') ?? '';
+    handleGetModels(res, APP_ID_TO_LAUNCH_TARGET[appId], appId === 'codex-subagents', opts.uiMode);
+  } else if (url === '/api/keys' && req.method === 'POST') {
+    handlePostKeys(req, res);
+  } else if (url === '/api/providers/refresh' && req.method === 'POST') {
+    handleProviderRefresh(req, res);
+  } else if (url === '/api/providers/refresh-all' && req.method === 'POST') {
+    handleRefreshAll(res);
+  } else if (url === '/api/providers/templates' && req.method === 'GET') {
+    handleGetTemplates(res);
+  } else if (url === '/api/providers/add' && req.method === 'POST') {
+    handleAddProvider(req, res);
+  } else if (url === '/api/providers/add-custom' && req.method === 'POST') {
+    handleAddCustomProvider(req, res);
+  } else if (url === '/api/providers/edit-custom' && req.method === 'POST') {
+    handleEditCustomProvider(req, res);
+  } else if (url === '/api/providers/delete' && req.method === 'POST') {
+    handleDeleteProvider(req, res);
+  } else if (url === '/api/providers/models/add' && req.method === 'POST') {
+    handleManualModel(req, res, 'add');
+  } else if (url === '/api/providers/models/remove' && req.method === 'POST') {
+    handleManualModel(req, res, 'remove');
+  } else if (url === '/api/providers/oauth/start' && req.method === 'POST') {
+    handleOAuthStart(req, res);
+  } else if (url.startsWith('/api/providers/oauth/status') && req.method === 'GET') {
+    handleOAuthStatus(req, res);
+  } else if (url.startsWith('/oauth/callback') && req.method === 'GET') {
+    handleOAuthCallback(req, res);
+  } else if (url.startsWith('/api/apps')) {
+    if (opts.uiMode === 'server') {
+      sendJson(res, 403, { error: 'App launch is unavailable in server admin UI mode.' });
+      return;
+    }
+    if (url === '/api/apps' && req.method === 'GET') handleGetApps(res);
+    else if (url === '/api/apps/path' && req.method === 'POST') handleSetAppPath(req, res);
+    else if (url === '/api/apps/launch' && req.method === 'POST') handleLaunchApp(req, res, opts);
+    else if (url === '/api/apps/browse-folder' && req.method === 'POST') handleBrowseFolder(res);
+    else sendJson(res, 404, { error: 'Not found' });
+  } else if (url === '/api/server/status' && req.method === 'GET') {
+    handleGetServerStatus(req, res);
+  } else if (url === '/api/server/providers' && req.method === 'GET') {
+    handleGetServerProviders(res);
+  } else if (url === '/api/server/start' && req.method === 'POST') {
+    handleStartServer(req, res, opts);
+  } else if (url === '/api/server/stop' && req.method === 'POST') {
+    handleStopServer(res, opts);
+  } else if (url === '/api/server/config' && req.method === 'POST') {
+    handlePostServerConfig(req, res);
+  } else {
+    sendJson(res, 404, { error: 'Not found' });
+  }
+}
+
+async function handleGetUpdateStatus(res: ServerResponse): Promise<void> {
+  sendJson(res, 200, await checkForUpdates());
+}
+
+function handleGetConfig(res: ServerResponse): void {
+  const prefs = loadPreferences();
+  sendJson(res, 200, {
+    favoriteModels: prefs.favoriteModels ?? [],
+    codexSubagentModels: prefs.codexSubagentModels ?? [],
+  });
+}
+
+async function handlePostConfig(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const update: Parameters<typeof savePreferences>[0] = {};
+    if (Array.isArray(body.favoriteModels)) update.favoriteModels = body.favoriteModels;
+    if (Array.isArray(body.codexSubagentModels)) {
+      const normalized = normalizeFavoriteModels(body.codexSubagentModels, CODEX_SUBAGENT_MODEL_CAP + 1);
+      if (normalized.length > CODEX_SUBAGENT_MODEL_CAP) {
+        sendJson(res, 400, { error: 'Codex Sub-agents are limited to 1 model' });
+        return;
+      }
+      update.codexSubagentModels = normalized;
+    }
+    if (Object.keys(update).length > 0) savePreferences(update);
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    sendJson(res, 400, { error: String(err) });
+  }
+}
+
+async function handleGetModels(
+  res: ServerResponse,
+  target?: RelayLaunchTarget,
+  codexSubagents = false,
+  uiMode?: 'full' | 'server',
+): Promise<void> {
+  try {
+    let catalog = (await fetchModelsWithTimeout())
+      .filter(provider => provider.authType !== 'oauth' || isUiCatalogOAuthProvider(provider.id, uiMode));
+    // Per-app launch pickers pass their target so unsupported/too-small models (context
+    // floor, format compatibility) are filtered the same way the CLI wizards filter them.
+    if (codexSubagents) catalog = providersForCodexSubagents(catalog);
+    else if (target) catalog = providersForTarget(catalog, target);
+    const registry = loadRegistry();
+    const registryById = new Map(registry.providers.map(p => [p.id, p]));
+    const rawCountById = new Map(registry.providers.map(p => [p.id, getProviderModels(p).length]));
+    const manualIdsByProvider = new Map(registry.providers.map(p => [p.id,
+      new Set(getProviderModels(p).filter(m => m.source === 'manual').map(m => m.id)),
+    ]));
+    const manualMetadata = (id: string) => {
+      const provider = registryById.get(id);
+      return {
+        supportsManualModels: provider ? provider.enabled && supportsManualModels(provider) : false,
+        manualModels: (provider?.manualModels ?? []).map(publicManualModel),
+      };
+    };
+    const customById = new Map(
+      registry.providers
+        .filter(rp => rp.templateId === 'custom-openai' || rp.templateId === 'custom-anthropic')
+        .map(rp => [rp.id, {
+          kind: rp.templateId === 'custom-anthropic' ? 'anthropic' as const : 'openai' as const,
+          baseUrl: rp.api.url ?? '',
+          headers: rp.api.headers ?? {},
+        }]),
+    );
+    const providers = catalog.map(p => ({
+      id: p.id,
+      name: p.name,
+      favoriteName: favoriteProviderDisplayName(p),
+      hasKey: Boolean(p.apiKey),
+      freeAccess: !p.apiKey && (() => {
+        const t = (registry.providers.find(rp => rp.id === p.id)?.templateId ?? p.id);
+        const { getTemplateById } = require('../provider-templates.js');
+        return getTemplateById(t)?.anonymousFreeModels === true;
+      })(),
+      authType: p.authType ?? 'api',
+      ...manualMetadata(p.id),
+      // Copilot's runtime catalog is policy-filtered by account plan. Never replace
+      // that safe count with the larger raw cache count.
+      modelCount: p.id === 'github-copilot' ? p.models.length : (rawCountById.get(p.id) ?? p.models.length),
+      ...(p.id === 'github-copilot' ? { subscription: copilotSubscription(p.providerData) } : {}),
+      ...(customById.has(p.id) ? { customEndpoint: customById.get(p.id) } : {}),
+      models: p.models.map(m => ({
+        id: m.id,
+        name: m.name,
+        isFree: m.isFree ?? false,
+        freeStatus: m.freeStatus,
+        freeLabel: freeStatusLabel(m.freeStatus),
+        contextWindow: m.contextWindow,
+        cost: m.cost,
+        claudeTransparentCompatible: supportsClaudeTransparentMode(m),
+        ...(manualIdsByProvider.get(p.id)?.has(m.id)
+          ? { source: 'manual' as const } : {}),
+      })),
+    }));
+
+    // OAuth providers with 0 models are excluded by materializeOne (no models = not materialized).
+    // Surface them anyway so their card appears and the user can click Refresh Models.
+    const materializedIds = new Set(catalog.map(p => p.id));
+    for (const rp of registry.providers) {
+      if (rp.authType !== 'oauth'
+        || !isUiCatalogOAuthProvider(rp.id, uiMode)
+        || !rp.enabled
+        || materializedIds.has(rp.id)) continue;
+      const credential = await resolveProviderCredential(rp.id, rp.authRef).catch(() => null);
+      if (!credential) continue;
+      providers.push({
+        id: rp.id,
+        name: rp.name,
+        favoriteName: favoriteProviderDisplayName({ id: rp.id, name: rp.name, authType: rp.authType }),
+        hasKey: true,
+        freeAccess: false,
+        authType: 'oauth',
+        ...manualMetadata(rp.id),
+        modelCount: 0,
+        ...(rp.id === 'github-copilot' ? { subscription: copilotSubscription(undefined) } : {}),
+        models: [],
+      });
+    }
+
+    // Empty configured API providers need a browser entry to add their first model.
+    // Do not restore providers excluded by a launch target's compatibility filter.
+    if (!target && !codexSubagents) {
+      for (const rp of registry.providers) {
+        if (!rp.enabled || !supportsManualModels(rp) || materializedIds.has(rp.id)
+          || getProviderModels(rp).length !== 0) continue;
+        const credential = await resolveProviderCredential(rp.id, rp.authRef).catch(() => null);
+        providers.push({
+          id: rp.id,
+          name: rp.name,
+          favoriteName: favoriteProviderDisplayName({ id: rp.id, name: rp.name, authType: rp.authType }),
+          hasKey: Boolean(credential),
+          freeAccess: false,
+          authType: rp.authType ?? 'api',
+          modelCount: 0,
+          ...manualMetadata(rp.id),
+          ...(customById.has(rp.id) ? { customEndpoint: customById.get(rp.id) } : {}),
+          models: [],
+        });
+      }
+    }
+
+    sendJson(res, 200, { providers });
+  } catch (err) {
+    sendCatalogFetchError(res, err, 'Model fetch');
+  }
+}
+
+function publicManualModel(model: ManualModel) {
+  return {
+    id: model.id,
+    name: model.name,
+    contextWindow: model.contextWindow,
+    validatedAt: model.validatedAt,
+    source: 'manual' as const,
+  };
+}
+
+async function handleManualModel(req: IncomingMessage, res: ServerResponse, action: 'add' | 'remove'): Promise<void> {
+  let body: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(await readBody(req));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('object required');
+    body = parsed as Record<string, unknown>;
+  } catch {
+    sendJson(res, 400, { ok: false, error: 'Request body must be a JSON object' });
+    return;
+  }
+  const { providerId, modelId, displayName, contextWindow } = body;
+  if (typeof providerId !== 'string' || !providerId.trim()
+    || typeof modelId !== 'string' || !modelId.trim()) {
+    sendJson(res, 400, { ok: false, error: 'providerId and modelId must be non-empty strings' });
+    return;
+  }
+  if (action === 'add' && ((displayName !== undefined && typeof displayName !== 'string')
+    || (contextWindow !== undefined && (typeof contextWindow !== 'number'
+      || !Number.isSafeInteger(contextWindow) || contextWindow <= 0)))) {
+    sendJson(res, 400, { ok: false, error: 'displayName must be a string and contextWindow must be a positive integer when provided' });
+    return;
+  }
+  try {
+    // Keep validation dependencies lazy; unrelated UI routes do not need them.
+    const { addManualModel, removeManualModel } = await import('../registry/manual-models.js');
+    const result = action === 'add'
+      ? await addManualModel({
+        providerId: providerId.trim(), modelId: modelId.trim(),
+        ...(typeof displayName === 'string' && displayName.trim() ? { displayName: displayName.trim() } : {}),
+        ...(typeof contextWindow === 'number' ? { contextWindow } : {}),
+      })
+      : removeManualModel(providerId.trim(), modelId.trim());
+    sendJson(res, 200, {
+      ok: result.ok,
+      ...(!result.ok ? { error: result.error ?? 'Manual model operation failed' } : {}),
+      ...(result.ok && 'model' in result && result.model ? { model: publicManualModel(result.model) } : {}),
+    });
+  } catch {
+    sendJson(res, 500, { ok: false, error: `Unable to ${action} manual model. Please try again.` });
+  }
+}
+
+function copilotSubscription(providerData?: Record<string, unknown>): { tier: 'free' | 'paid' | 'unknown'; label: string } {
+  const tier = copilotPlanTier(providerData);
+  if (tier === 'free') return { tier, label: 'Copilot Free' };
+  if (tier === 'paid') return { tier, label: 'Copilot Paid' };
+  return { tier, label: 'Plan unverified' };
+}
+
+async function handlePostKeys(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const { providerId, key, confirmOverwrite } = body;
+    if (!providerId || typeof providerId !== 'string') {
+      sendJson(res, 400, { error: 'providerId required' }); return;
+    }
+    if (!key || typeof key !== 'string' || key.trim().length === 0) {
+      sendJson(res, 400, { error: 'key must be a non-empty string' }); return;
+    }
+    const authRef = preferredRelayCredentialAuthRef(providerId, `keyring:provider:${providerId}`);
+    const existing = await readStoredProviderCredential(authRef)
+      ?? (providerId === 'go' || providerId === 'zen'
+        ? await readStoredProviderCredential('keyring:global:opencode')
+        : null);
+    if (existing && existing !== key.trim() && confirmOverwrite !== true) {
+      sendJson(res, 409, { ok: false, needsConfirmation: true, error: 'A different key is already stored in Relay.' });
+      return;
+    }
+    const saved = await saveProviderCredential(authRef, key.trim());
+    if (saved) {
+      sendJson(res, 200, { ok: true });
+    } else {
+      sendJson(res, 500, { error: 'Credential store unavailable — key not saved' });
+    }
+  } catch (err) {
+    sendJson(res, 400, { error: String(err) });
+  }
+}
+
+const CUSTOM_TEMPLATES = [
+  { id: '__custom_openai__', name: 'Custom OpenAI-compatible', signupUrl: null, authType: 'api', custom: true },
+  { id: '__custom_anthropic__', name: 'Custom Anthropic-compatible', signupUrl: null, authType: 'api', custom: true },
+] as const;
+
+function handleGetTemplates(res: ServerResponse): void {
+  const registry = loadRegistry();
+  const configured = new Set(registry.providers.map(p => p.id));
+
+  const templates = new Map<string, any>();
+  const apiTemplates = listAddableTemplates(configured).map(t => ({
+    id: t.id,
+    name: t.name,
+    signupUrl: t.signupUrl ?? null,
+    authType: t.authType,
+    anonymousFreeModels: t.anonymousFreeModels ?? false,
+    urlPrompt: t.urlPrompt ?? null,
+    accountIdPrompt: t.accountIdPrompt ?? null,
+    defaultBaseUrl: t.defaultBaseUrl ?? null,
+    apiKeyOptional: t.apiKeyOptional ?? false,
+    authMethods: t.authMethods ?? [t.authType],
+    custom: false,
+  }));
+  for (const template of apiTemplates) templates.set(template.id, template);
+
+  const oauthTemplates = listVisibleOAuthTemplates(configured)
+    .map(t => ({
+      id: t.id,
+      name: t.name,
+      signupUrl: t.signupUrl ?? null,
+      authType: t.authType,
+      authMethods: t.authMethods ?? [t.authType],
+      subscriptionRisk: t.subscriptionRisk ?? false,
+      custom: false,
+    }));
+  for (const template of oauthTemplates) {
+    const existing = templates.get(template.id);
+    if (existing) {
+      templates.set(template.id, {
+        ...existing,
+        authMethods: [...new Set([...(existing.authMethods ?? []), ...(template.authMethods ?? [])])],
+        subscriptionRisk: template.subscriptionRisk,
+      });
+    } else {
+      templates.set(template.id, template);
+    }
+  }
+
+  const sorted = [...templates.values()].sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base', numeric: true }));
+  sendJson(res, 200, { templates: [...sorted, ...CUSTOM_TEMPLATES] });
+}
+
+async function handleAddCustomProvider(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as {
+      kind?: string; displayName?: string; baseUrl?: string; apiKey?: string;
+      headers?: Record<string, string>; confirmDuplicate?: boolean;
+    };
+    const { kind, displayName, baseUrl, apiKey = '', headers, confirmDuplicate } = body;
+    if (kind !== 'openai' && kind !== 'anthropic') {
+      sendJson(res, 400, { error: 'kind must be "openai" or "anthropic"' }); return;
+    }
+    if (!displayName?.trim()) {
+      sendJson(res, 400, { error: 'displayName required' }); return;
+    }
+    if (!baseUrl?.trim()) {
+      sendJson(res, 400, { error: 'baseUrl required' }); return;
+    }
+    const result = await addCustomEndpointProvider({
+      kind: kind as CustomEndpointKind,
+      displayName: displayName.trim(),
+      baseUrl: baseUrl.trim(),
+      apiKey: apiKey.trim(),
+      allowInsecureLocal: true,
+      headers: headers && Object.keys(headers).length > 0 ? headers : undefined,
+      confirmDuplicate: confirmDuplicate === true,
+    });
+    if (result.added) {
+      sendJson(res, 200, { ok: true, name: displayName.trim(), count: result.modelCount ?? 0 });
+    } else {
+      sendJson(res, 200, {
+        ok: false,
+        error: result.error,
+        hint: result.hint,
+        ...(result.duplicateOf ? { duplicateOf: result.duplicateOf } : {}),
+      });
+    }
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleEditCustomProvider(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as {
+      providerId?: string;
+      displayName?: string;
+      baseUrl?: string;
+      apiKey?: string;
+      headers?: Record<string, string>;
+      saveAnyway?: boolean;
+    };
+    if (!body.providerId?.trim()) {
+      sendJson(res, 400, { error: 'providerId required' });
+      return;
+    }
+    const result = await updateCustomEndpointProvider({
+      providerId: body.providerId.trim(),
+      displayName: body.displayName?.trim(),
+      baseUrl: body.baseUrl?.trim(),
+      apiKey: body.apiKey?.trim(),
+      headers: body.headers,
+      allowInsecureLocal: true,
+      saveAnyway: body.saveAnyway === true,
+    });
+    if (result.updated) {
+      sendJson(res, 200, {
+        ok: true,
+        name: result.provider?.name ?? body.providerId,
+        count: result.modelCount ?? 0,
+        ...(result.modelsStale ? { modelsStale: true } : {}),
+      });
+    } else {
+      sendJson(res, 200, {
+        ok: false,
+        error: result.error,
+        hint: result.hint,
+        ...(result.canSaveAnyway ? { canSaveAnyway: true } : {}),
+      });
+    }
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleAddProvider(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const { templateId, key, baseUrl, accountId } = body;
+    if (!templateId || typeof templateId !== 'string') {
+      sendJson(res, 400, { error: 'templateId required' }); return;
+    }
+    const { listSupportedTemplates } = await import('../provider-templates.js');
+    const template = listSupportedTemplates().find(t => t.id === templateId);
+    if (!template) {
+      sendJson(res, 404, { error: `Template '${templateId}' not found` }); return;
+    }
+    const rawKey = typeof key === 'string' ? key.trim() : '';
+    if (!rawKey && !template.anonymousFreeModels && !template.apiKeyOptional) {
+      sendJson(res, 400, { error: 'key must be a non-empty string' }); return;
+    }
+    const keyText = template.apiKeyOptional && !rawKey && !template.anonymousFreeModels ? template.id : rawKey;
+
+    let baseUrlOverride: string | undefined;
+    if (template.accountIdPrompt) {
+      const rawAccountId = typeof accountId === 'string' ? accountId.trim() : '';
+      if (!rawAccountId) {
+        sendJson(res, 400, { error: 'accountId required' }); return;
+      }
+      baseUrlOverride = template.defaultBaseUrl?.replace('{ACCOUNT_ID}', rawAccountId);
+    } else if (template.urlPrompt) {
+      baseUrlOverride = typeof baseUrl === 'string' ? baseUrl.trim() : '';
+      if (!baseUrlOverride) {
+        sendJson(res, 400, { error: 'baseUrl required' }); return;
+      }
+      const usesHttp = /^http:\/\//i.test(baseUrlOverride);
+      const valid = await validateCustomEndpointUrl(baseUrlOverride, { allowInsecureLocal: usesHttp });
+      if (!valid.ok) {
+        sendJson(res, 400, { error: valid.error ?? 'Invalid URL', hint: valid.hint }); return;
+      }
+    }
+
+    const replaceExisting = template.id === 'cline-pass' && body.replaceExisting === true;
+    const result: AddTemplateResult = await addProviderFromTemplate(template, keyText, {
+      baseUrl: baseUrlOverride,
+      replaceExisting,
+    });
+    if (result.added) {
+      sendJson(res, 200, { ok: true, name: template.name, count: result.modelCount ?? 0 });
+    } else {
+      sendJson(res, 200, { ok: false, error: result.error, hint: result.hint });
+    }
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleRefreshAll(res: ServerResponse): Promise<void> {
+  try {
+    const result = await refreshAllProviderModels(async provider => {
+      if (!provider.authRef) return null;
+      return resolveProviderCredential(provider.id, provider.authRef);
+    });
+    // Return per-provider summary: id, name, ok, count
+    const summary = result.refreshed.map(r => {
+      // OAuth providers can't refresh model lists via the standard API endpoint —
+      // the token is for user sessions, not model discovery. This is expected, not broken.
+      const isOAuthExpected = !r.ok && !r.skipped && r.reason?.includes('OAuth token');
+      return {
+        id: r.id,
+        name: r.name,
+        ok: r.ok || isOAuthExpected,
+        count: r.modelCount ?? r.previousModelCount ?? 0,
+        skipped: r.skipped ?? isOAuthExpected,
+        oauthWarning: isOAuthExpected,
+        reason: r.reason,
+      };
+    });
+    sendJson(res, 200, { ok: true, providers: summary, total: summary.reduce((n, p) => n + p.count, 0) });
+  } catch (err) {
+    sendJson(res, 500, { ok: false, error: String(err) });
+  }
+}
+
+async function handleProviderRefresh(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const { providerId } = body;
+    if (!providerId || typeof providerId !== 'string') {
+      sendJson(res, 400, { error: 'providerId required' }); return;
+    }
+    const registry = loadRegistry();
+    const registryProvider = registry.providers.find(p => p.id === providerId);
+    if (!registryProvider) {
+      sendJson(res, 200, { ok: false, error: 'Provider not found in registry' }); return;
+    }
+    // A key typed into the UI is a one-request override. Do not let env/keychain
+    // resolution silently replace it before the provider API sees the request.
+    const explicitKey = typeof body.key === 'string' ? body.key.trim() : '';
+    const apiKey = explicitKey || await resolveProviderCredential(providerId, registryProvider.authRef);
+    // Use the same refresh path as `relay-ai providers refresh-models` so counts match CLI
+    const result = await refreshProviderModels(providerId, apiKey, registry);
+    if (result.ok) {
+      sendJson(res, 200, { ok: true, count: result.modelCount ?? result.previousModelCount ?? 0 });
+    } else {
+      sendJson(res, 200, { ok: false, error: result.reason ?? 'Refresh failed' });
+    }
+  } catch (err) {
+    sendJson(res, 200, { ok: false, error: String(err) });
+  }
+}
+
+async function handleDeleteProvider(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { providerId?: string };
+    const { providerId } = body;
+    if (!providerId || typeof providerId !== 'string') {
+      sendJson(res, 400, { error: 'providerId required' }); return;
+    }
+    const result = await removeProviderFromRegistry(providerId);
+    if (result.removed) {
+      sendJson(res, 200, { ok: true, name: result.name });
+    } else {
+      sendJson(res, 200, { ok: false, error: result.error ?? 'Provider not found' });
+    }
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+const DEVICE_CODE_PROVIDER_IDS = new Set(['xai-oauth', 'openai-oauth', 'github-copilot', 'cline-pass']);
+const PKCE_PROVIDER_IDS = new Set(['claude-code', 'antigravity']);
+// Device-code OAuth can be started from the UI. PKCE (Claude Code / Antigravity)
+// stays CLI-secret for add/sign-in, but a provider already in the registry still
+// belongs on the local Providers page. Docker/server admin UI stays device-code only.
+const NATIVE_OAUTH_PROVIDER_IDS = DEVICE_CODE_PROVIDER_IDS;
+
+function isUiCatalogOAuthProvider(providerId: string, uiMode?: 'full' | 'server'): boolean {
+  if (DEVICE_CODE_PROVIDER_IDS.has(providerId)) return true;
+  if (uiMode === 'server') return false;
+  return PKCE_PROVIDER_IDS.has(providerId);
+}
+
+async function refreshOAuthProviderModels(providerId: string): Promise<void> {
+  const registry = loadRegistry();
+  const entry = registry.providers.find(p => p.id === providerId);
+  if (!entry) return;
+  const apiKey = await resolveProviderCredential(providerId, entry.authRef);
+  await refreshProviderModels(providerId, apiKey, registry);
+}
+
+async function handleOAuthStart(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as { providerId?: string };
+    const { providerId } = body;
+    if (!providerId || !NATIVE_OAUTH_PROVIDER_IDS.has(providerId)) {
+      sendJson(res, 400, { error: 'Unsupported OAuth provider.' }); return;
+    }
+
+    const sessionId = randomUUID();
+
+    if (providerId === 'xai-oauth') {
+      const device = await requestXaiDeviceCode();
+      const url = device.verification_uri_complete ?? device.verification_uri;
+      const session: OAuthSession = { status: 'pending', url, userCode: device.user_code, providerId };
+      oauthSessions.set(sessionId, session);
+
+      pollXaiDeviceCodeToken(device).then(async tokens => {
+        await saveNativeOAuthCredential(providerId, tokens);
+        await refreshOAuthProviderModels(providerId);
+        oauthSessions.set(sessionId, { ...session, status: 'done' });
+      }).catch(err => {
+        oauthSessions.set(sessionId, { ...session, status: 'error', error: String(err) });
+      });
+
+      sendJson(res, 200, { sessionId, url, userCode: device.user_code });
+      return;
+    }
+
+    if (providerId === 'github-copilot') {
+      const device = await requestGithubDeviceCode();
+      const url = device.verification_uri;
+      const session: OAuthSession = { status: 'pending', url, userCode: device.user_code, providerId };
+      oauthSessions.set(sessionId, session);
+
+      pollGithubDeviceCodeToken(device).then(async tokens => {
+        await saveNativeOAuthCredential(providerId, tokens);
+        await refreshOAuthProviderModels(providerId);
+        oauthSessions.set(sessionId, { ...session, status: 'done' });
+      }).catch(err => {
+        oauthSessions.set(sessionId, { ...session, status: 'error', error: String(err) });
+      });
+
+      sendJson(res, 200, { sessionId, url, userCode: device.user_code });
+      return;
+    }
+
+    if (providerId === 'cline-pass') {
+      const device = await requestClinePassDeviceCode();
+      const url = device.verification_uri_complete ?? device.verification_uri;
+      const session: OAuthSession = { status: 'pending', url, userCode: device.user_code, providerId };
+      oauthSessions.set(sessionId, session);
+
+      pollClinePassDeviceCode(device).then(async result => {
+        await saveNativeOAuthCredential(providerId, result.tokens, result.accountId, result.providerData);
+        await refreshOAuthProviderModels(providerId);
+        oauthSessions.set(sessionId, { ...session, status: 'done' });
+      }).catch(err => {
+        oauthSessions.set(sessionId, { ...session, status: 'error', error: String(err) });
+      });
+
+      sendJson(res, 200, { sessionId, url, userCode: device.user_code });
+      return;
+    }
+
+    if (PKCE_PROVIDER_IDS.has(providerId)) {
+      if (providerId === 'claude-code') {
+        sendJson(res, 400, {
+          error: 'Claude Code OAuth must be completed in the terminal: relay-ai providers auth claude-code',
+        });
+        return;
+      }
+
+      // PKCE / browser-redirect flow (claude-code, future: antigravity).
+      const host = (req.headers.host as string | undefined) ?? '127.0.0.1';
+      const redirectUri = guiCallbackRedirectUri(host);
+
+      let pkce: Awaited<ReturnType<typeof buildAntigravityAuthUrl>>;
+      if (providerId === 'antigravity') {
+        pkce = await buildAntigravityAuthUrl(redirectUri);
+      } else {
+        sendJson(res, 400, { error: `PKCE flow for "${providerId}" not yet implemented` }); return;
+      }
+
+      const { authUrl, codeVerifier, oauthState } = pkce;
+      const session: OAuthSession = {
+        status: 'pending',
+        url: authUrl,
+        providerId,
+        codeVerifier,
+        oauthState,
+      };
+      oauthSessions.set(sessionId, session);
+
+      // The callback route will call session.codeResolver when the code arrives.
+      const codePromise = new Promise<string>((resolve, reject) => {
+        session.codeResolver = resolve;
+        session.errorRejecter = (err: string) => reject(new Error(err));
+        setTimeout(() => reject(new Error('OAuth timeout — sign-in not completed')), 10 * 60 * 1000);
+      });
+      oauthSessions.set(sessionId, session); // re-set with resolvers attached
+
+      codePromise.then(async (code) => {
+        let providerData: Record<string, unknown> = {};
+        let accountId: string | undefined;
+        let tokens: import('../oauth/types.js').OAuthTokenResponse;
+
+        if (providerId === 'antigravity') {
+          const result = await completeAntigravityExchange(code, codeVerifier, redirectUri);
+          tokens = result.tokens;
+          accountId = result.userInfo.email;
+          if (result.projectId) providerData.projectId = result.projectId;
+          if (result.tierId) providerData.tier = result.tierId;
+        } else {
+          throw new Error(`Unknown PKCE provider: ${providerId}`);
+        }
+
+        await saveNativeOAuthCredential(providerId, tokens, accountId, providerData);
+
+        await refreshOAuthProviderModels(providerId);
+        oauthSessions.set(sessionId, { ...session, status: 'done' });
+      }).catch(err => {
+        oauthSessions.set(sessionId, { ...session, status: 'error', error: String(err) });
+      });
+
+      sendJson(res, 200, { sessionId, authUrl, pkce: true });
+      return;
+    }
+
+    // openai-oauth
+    const device = await requestOpenAiDeviceCode();
+    const url = openAiDeviceCodeUrl();
+    const session: OAuthSession = { status: 'pending', url, userCode: device.user_code, providerId };
+    oauthSessions.set(sessionId, session);
+
+    pollOpenAiDeviceCodeToken(device).then(async ({ tokens, accountId }) => {
+      await saveNativeOAuthCredential(providerId, tokens, accountId);
+      await refreshOAuthProviderModels(providerId);
+      oauthSessions.set(sessionId, { ...session, status: 'done' });
+    }).catch(err => {
+      oauthSessions.set(sessionId, { ...session, status: 'error', error: String(err) });
+    });
+
+    sendJson(res, 200, { sessionId, url, userCode: device.user_code });
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+function handleOAuthStatus(req: IncomingMessage, res: ServerResponse): void {
+  const searchParams = new URL(req.url ?? '', 'http://localhost').searchParams;
+  const sessionId = searchParams.get('sessionId') ?? '';
+  const session = oauthSessions.get(sessionId);
+  if (!session) { sendJson(res, 404, { error: 'Session not found or expired' }); return; }
+  sendJson(res, 200, { status: session.status, error: session.error });
+  if (session.status !== 'pending') oauthSessions.delete(sessionId);
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function callbackPage(type: 'success' | 'error', message: string): string {
+  const icon = type === 'success' ? '&#10003;' : '&#10007;';
+  const color = type === 'success' ? '#22c55e' : '#ef4444';
+  const title = type === 'success' ? 'Authentication successful' : 'Authentication failed';
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${title}</title></head>
+<body style="font-family:system-ui;display:flex;justify-content:center;align-items:center;height:100vh;margin:0">
+<div style="text-align:center;padding:2rem;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.1);max-width:400px">
+<div style="color:${color};font-size:2.5rem">${icon}</div>
+<h1 style="margin:.5rem 0">${title}</h1>
+<p style="color:#666">${escapeHtml(message)}</p>
+</div></body></html>`;
+}
+
+function handleOAuthCallback(req: IncomingMessage, res: ServerResponse): void {
+  const sp = new URL(req.url ?? '', 'http://localhost').searchParams;
+  const code = sp.get('code') ?? '';
+  const state = sp.get('state') ?? '';
+  const error = sp.get('error') ?? '';
+
+  let matchedSession: OAuthSession | undefined;
+  for (const session of oauthSessions.values()) {
+    if (session.oauthState === state) { matchedSession = session; break; }
+  }
+
+  if (!matchedSession) {
+    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(callbackPage('error', 'Unknown or expired OAuth session. Please try signing in again.'));
+    return;
+  }
+
+  if (error) {
+    matchedSession.errorRejecter?.(error);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(callbackPage('error', `Authorization denied: ${error}`));
+    return;
+  }
+
+  if (!code) {
+    matchedSession.errorRejecter?.('No authorization code received');
+    res.writeHead(400, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(callbackPage('error', 'No authorization code received. Please try again.'));
+    return;
+  }
+
+  matchedSession.codeResolver?.(code);
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(callbackPage('success', 'You can close this tab and return to relay-ai.'));
+}
+
+function handleGetApps(res: ServerResponse): void {
+  try {
+    const apps = getSupportedApps();
+    sendJson(res, 200, { apps, recentLaunchFolders: loadPreferences().recentLaunchFolders ?? [] });
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+
+/** Maps a `relay-ai ui` app card id to the launch target `target-compatibility.ts` understands. */
+const APP_ID_TO_LAUNCH_TARGET: Record<string, RelayLaunchTarget> = {
+  claude: 'claude',
+  'claude-app': 'claude-app',
+  codex: 'codex',
+  'codex-app': 'codex-app',
+  gemini: 'gemini',
+  agy: 'antigravity',
+  antigravity: 'antigravity',
+  'antigravity-ide': 'antigravity',
+};
+
+async function handleLaunchApp(req: IncomingMessage, res: ServerResponse, opts: UiApiOptions): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const { appId, favorites, cwd } = body;
+    const httpProxy = body.httpProxy === true;
+    const withNative = body.withNative === true;
+    let { providerId, modelId } = body as { providerId?: string; modelId?: string };
+    if (!appId) {
+      sendJson(res, 400, { error: 'Missing appId' });
+      return;
+    }
+    if (!getSupportedApp(appId)) {
+      sendJson(res, 400, { error: `Unknown app: ${appId}` });
+      return;
+    }
+    if (body.httpProxy !== undefined && typeof body.httpProxy !== 'boolean') {
+      sendJson(res, 400, { error: 'httpProxy must be true or false.' });
+      return;
+    }
+    if (body.withNative !== undefined && typeof body.withNative !== 'boolean') {
+      sendJson(res, 400, { error: 'withNative must be true or false.' });
+      return;
+    }
+    if (withNative && appId !== 'codex' && appId !== 'codex-app') {
+      sendJson(res, 400, { error: 'Native Codex mixed mode is available only for Codex CLI and ChatGPT Desktop.' });
+      return;
+    }
+    if (httpProxy && appId !== 'claude') {
+      sendJson(res, 400, { error: 'Anthropic + Relay mode is available only for Claude Code CLI.' });
+      return;
+    }
+
+    const { installed, path } = detectApp(appId);
+    if (!installed || !path) {
+      sendJson(res, 400, { error: `App ${appId} is not installed on this system.` });
+      return;
+    }
+
+    if (!favorites && (providerId || modelId) && (!providerId || !modelId)) {
+      sendJson(res, 400, { error: 'Both providerId and modelId are required to launch a specific Relay model.' });
+      return;
+    }
+    if (httpProxy && providerId && modelId) {
+      let catalog;
+      try {
+        catalog = await fetchModelsWithTimeout();
+      } catch (err) {
+        sendCatalogFetchError(res, err, 'Model validation');
+        return;
+      }
+      const selectedModel = catalog
+        .find(provider => provider.id === providerId)
+        ?.models.find(model => model.id === modelId);
+      if (!selectedModel || !supportsClaudeTransparentMode(selectedModel)) {
+        sendJson(res, 400, {
+          error: 'The selected model cannot be combined with your Anthropic login.',
+        });
+        return;
+      }
+    }
+
+    // Resolve the first favorite so the terminal can skip its interactive picker.
+    // Without this the launch command has no --provider/--model and the terminal
+    // shows the full provider wizard even though the user already chose "Favorites".
+    if (favorites && !httpProxy && !providerId && !modelId) {
+      const prefs = loadPreferences();
+      const favList = prefs.favoriteModels ?? [];
+      if (favList.length > 0) {
+        providerId = favList[0]!.providerId;
+        modelId = favList[0]!.modelId;
+      }
+    }
+
+    const launchFolder = typeof cwd === 'string' && cwd.trim() ? cwd.trim() : undefined;
+    if (launchFolder) {
+      try {
+        if (!statSync(launchFolder).isDirectory()) {
+          sendJson(res, 400, { error: 'Launch folder must be a directory.' });
+          return;
+        }
+      } catch {
+        sendJson(res, 400, { error: 'Launch folder does not exist.' });
+        return;
+      }
+      recordLaunchFolder(launchFolder);
+    }
+
+    const launchCmd = getRelayLaunchCommand(appId, {
+      providerId,
+      modelId,
+      cwd: launchFolder,
+      trace: opts.trace,
+      httpProxy,
+      ...(withNative ? { withNative: true } : {}),
+    });
+    traceUi(
+      opts,
+      `launch app=${appId} provider=${providerId ?? ''} model=${modelId ?? ''} favorites=${Boolean(favorites)} http-proxy=${httpProxy} resolved-from-favorites=${Boolean(favorites && providerId)} cwd=${launchFolder ?? ''} command=${launchCmd}`,
+    );
+
+    // Execute command asynchronously to open the terminal window detached
+    exec(launchCmd, (err) => {
+      if (err) {
+        traceUi(opts, `launch error app=${appId} error=${err.message}`);
+        console.error('Failed to spawn native terminal window:', err);
+      }
+    });
+
+    sendJson(res, 200, { ok: true, command: launchCmd });
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleSetAppPath(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    const { appId, path } = body;
+    if (!appId || typeof appId !== 'string') {
+      sendJson(res, 400, { error: 'Missing appId' });
+      return;
+    }
+
+    if (path !== null && (typeof path !== 'string' || !path.trim())) {
+      sendJson(res, 400, { error: 'path must be a non-empty string, or null to clear the override.' });
+      return;
+    }
+
+    const trimmed = typeof path === 'string' ? path.trim() : null;
+    if (trimmed && !existsSync(trimmed)) {
+      sendJson(res, 400, { error: 'That path does not exist.' });
+      return;
+    }
+
+    setAppPathOverride(appId, trimmed);
+    sendJson(res, 200, { ok: true, apps: getSupportedApps() });
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleGetServerStatus(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    sendJson(res, 200, await getServerStatus({ requestHost: hostFromHeader(req.headers.host) }));
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleGetServerProviders(res: ServerResponse): Promise<void> {
+  try {
+    const catalog = await fetchModelsWithTimeout({ agent: 'server' });
+    sendJson(res, 200, { providers: providerOptionsFromCatalog(catalog) });
+  } catch (err) {
+    sendCatalogFetchError(res, err, 'Provider fetch');
+  }
+}
+
+async function handleStartServer(req: IncomingMessage, res: ServerResponse, opts: UiApiOptions): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req)) as Partial<ServerStartRequest>;
+    if (typeof body.favoritesOnly !== 'boolean') {
+      sendJson(res, 400, { error: 'favoritesOnly must be a boolean' }); return;
+    }
+    if (typeof body.maskGatewayIds !== 'boolean') {
+      sendJson(res, 400, { error: 'maskGatewayIds must be a boolean' }); return;
+    }
+    if (body.listenMode !== 'local' && body.listenMode !== 'network') {
+      sendJson(res, 400, { error: 'listenMode must be "local" or "network"' }); return;
+    }
+    // Server admin UI / Docker: published ports only reach 0.0.0.0.
+    const listenMode = opts.uiMode === 'server' ? 'network' : body.listenMode;
+    const request: ServerStartRequest = {
+      favoritesOnly: body.favoritesOnly,
+      freeModelsOnly: Boolean(body.freeModelsOnly),
+      exposedProviders: Array.isArray(body.exposedProviders) ? body.exposedProviders : null,
+      maskGatewayIds: body.maskGatewayIds,
+      listenMode,
+      autostart: typeof body.autostart === 'boolean' ? body.autostart : undefined,
+      passwordMode: body.passwordMode === 'saved' ? 'saved' : 'new',
+      password: typeof body.password === 'string' ? body.password : undefined,
+      savePassword: Boolean(body.savePassword),
+    };
+    const result = await startGatewayServer(request, {
+      requestHost: hostFromHeader(req.headers.host),
+    });
+    if (result.ok) {
+      notifyServerLifecycle(opts, {
+        type: 'started',
+        listenMode: request.listenMode,
+        modelCount: result.status.models?.length ?? 0,
+      });
+    }
+    sendJson(res, 200, result);
+  } catch (err) {
+    sendJson(res, 500, { ok: false, error: String(err) });
+  }
+}
+
+async function handlePostServerConfig(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  try {
+    const body = JSON.parse(await readBody(req));
+    if (typeof body.autostart === 'boolean') {
+      setServerAutostart(body.autostart);
+    }
+    sendJson(res, 200, { ok: true });
+  } catch (err) {
+    sendJson(res, 400, { error: String(err) });
+  }
+}
+
+async function handleStopServer(res: ServerResponse, opts: UiApiOptions): Promise<void> {
+  try {
+    const result = await stopGatewayServer();
+    if (result.stopped) notifyServerLifecycle(opts, { type: 'stopped' });
+    sendJson(res, 200, result);
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}
+
+async function handleBrowseFolder(res: ServerResponse): Promise<void> {
+  try {
+    let resultPath = '';
+    const isMac = process.platform === 'darwin';
+    const isWindows = process.platform === 'win32';
+
+    if (isMac) {
+      const script = 'POSIX path of (choose folder with prompt "Select launch folder:")';
+      try {
+        const { stdout } = await execAsync(`osascript -e '${script}'`);
+        resultPath = stdout.trim();
+      } catch (err: any) {
+        if (err.code === 1 || String(err.stderr).includes('-128') || String(err.stdout).includes('-128')) {
+          sendJson(res, 200, { ok: true, canceled: true });
+          return;
+        }
+        throw err;
+      }
+    } else if (isWindows) {
+      // The try/catch + exit 1 is load-bearing: without it PowerShell reports
+      // dialog failures (e.g. "not running in UserInteractive mode" when the
+      // UI server was started from a non-interactive session like SSH) as
+      // non-terminating errors and still exits 0 with empty stdout, which
+      // looks identical to the user canceling.
+      //
+      // The owner form must be Show()n (invisible: opacity 0, 1x1, no
+      // border/taskbar) — WinForms only applies TopMost to the native handle
+      // when the form is actually shown, and without a shown TopMost owner
+      // the dialog opens at the bottom of the z-order, behind the browser,
+      // with no taskbar button: it exists but the user never sees it.
+      const psCommand = [
+        'try {',
+        '  Add-Type -AssemblyName System.Windows.Forms',
+        '  $f = New-Object System.Windows.Forms.FolderBrowserDialog',
+        '  $f.Description = "Select launch folder"',
+        '  $owner = New-Object System.Windows.Forms.Form',
+        '  $owner.TopMost = $true',
+        '  $owner.ShowInTaskbar = $false',
+        '  $owner.FormBorderStyle = "None"',
+        '  $owner.Opacity = 0',
+        '  $owner.Width = 1',
+        '  $owner.Height = 1',
+        '  $owner.StartPosition = "CenterScreen"',
+        '  $owner.Show()',
+        '  $owner.Activate()',
+        '  if ($f.ShowDialog($owner) -eq "OK") { $f.SelectedPath }',
+        '  $owner.Close()',
+        '} catch {',
+        '  [Console]::Error.WriteLine($_.Exception.Message)',
+        '  exit 1',
+        '}',
+      ].join('\n');
+      try {
+        // -Sta is required: System.Windows.Forms dialogs throw
+        // ThreadStateException under PowerShell's default MTA apartment state.
+        // -EncodedCommand sidesteps cmd.exe quoting: -Command "..." mangled
+        // the script (its newlines were never actually stripped).
+        const encoded = Buffer.from(psCommand, 'utf16le').toString('base64');
+        const { stdout } = await execAsync(`powershell -NoProfile -Sta -EncodedCommand ${encoded}`);
+        resultPath = stdout.trim();
+      } catch (err) {
+        sendJson(res, 500, { error: `Failed to open folder picker: ${err instanceof Error ? err.message : String(err)}` });
+        return;
+      }
+    } else {
+      try {
+        const { stdout } = await execAsync('zenity --file-selection --directory --title="Select launch folder"');
+        resultPath = stdout.trim();
+      } catch {
+        try {
+          const { stdout } = await execAsync('kdialog --getexistingdirectory .');
+          resultPath = stdout.trim();
+        } catch {
+          sendJson(res, 500, { error: 'No GUI folder picker available on this platform' });
+          return;
+        }
+      }
+    }
+
+    if (!resultPath) {
+      sendJson(res, 200, { ok: true, canceled: true });
+      return;
+    }
+
+    sendJson(res, 200, { ok: true, path: resultPath });
+  } catch (err) {
+    sendJson(res, 500, { error: String(err) });
+  }
+}

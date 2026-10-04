@@ -1,0 +1,29 @@
+node_modules/
+docs/plans/
+*.js.map
+*.tgz
+.env
+.env.*
+!.env.docker.example
+.DS_Store
+*.log
+npm-debug.log*
+coverage/
+*.tsbuildinfo
+spike/
+vertex-models.json
+
+# IDE / Editor folders
+.vscode/
+.idea/
+.cursor/
+.agy/
+
+# Local agent planning / logs
+.claude/
+.gemini/
+.planning/
+.worktrees/
+docs/superpowers/
+ANTIGRAVITY-DEBUG-SESSION.md
+.opencode-autopilot/

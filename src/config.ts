@@ -1,0 +1,358 @@
+import type { UserPreferences, FavoriteModel } from './types.js';
+import { dirname, join } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { getAppHome, getConfigPath, getLegacyAppHome, getLegacyConfPath } from './paths.js';
+import { CODEX_SUBAGENT_MODEL_CAP, MAX_MODEL_CATALOG } from './constants.js';
+
+function readJsonFile(path: string): UserPreferences | null {
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    return parsed && typeof parsed === 'object' ? parsed as UserPreferences : null;
+  } catch {
+    return null;
+  }
+}
+
+function ensureAppHomeMigrated(): void {
+  const configPath = getConfigPath();
+  if (existsSync(configPath)) return;
+
+  const legacyConfig = join(getLegacyAppHome(), 'config.json');
+  if (!existsSync(legacyConfig)) return;
+
+  mkdirSync(getAppHome(), { recursive: true, mode: 0o700 });
+  copyFileSync(legacyConfig, configPath);
+
+  const legacyVertex = join(getLegacyAppHome(), 'vertex-models.json');
+  const vertexPath = join(getAppHome(), 'vertex-models.json');
+  if (existsSync(legacyVertex) && !existsSync(vertexPath)) {
+    copyFileSync(legacyVertex, vertexPath);
+  }
+}
+
+function ensureConfigMigrated(): void {
+  ensureAppHomeMigrated();
+
+  const configPath = getConfigPath();
+  if (existsSync(configPath)) return;
+
+  const legacyPath = getLegacyConfPath();
+  if (!existsSync(legacyPath)) return;
+
+  const legacy = readJsonFile(legacyPath);
+  if (!legacy) return;
+
+  mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+  writeFileSync(configPath, `${JSON.stringify(legacy, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+
+  try {
+    renameSync(legacyPath, `${legacyPath}.migrated`);
+  } catch {
+    // Migration copy is enough; renaming is best-effort.
+  }
+}
+
+function readConfig(): UserPreferences {
+  ensureConfigMigrated();
+  return migrateAntigravityFavorites(readJsonFile(getConfigPath()) ?? {});
+}
+
+/**
+ * Antigravity used to keep its own favorites list (capped by its native picker
+ * slots). It now uses the general favorites, so fold the old list in once —
+ * duplicates skipped, capped at MAX_MODEL_CATALOG — and drop the old keys.
+ */
+export function migrateAntigravityFavorites(config: UserPreferences): UserPreferences {
+  const legacy = config as UserPreferences & {
+    antigravityCliFavoriteModels?: FavoriteModel[];
+    antigravityCliFavoritesHintShown?: boolean;
+  };
+  if (!('antigravityCliFavoriteModels' in legacy) && !('antigravityCliFavoritesHintShown' in legacy)) return config;
+
+  const merged = [...(legacy.favoriteModels ?? [])];
+  for (const fav of legacy.antigravityCliFavoriteModels ?? []) {
+    if (merged.length >= MAX_MODEL_CATALOG) break;
+    if (!merged.some(m => m.providerId === fav.providerId && m.modelId === fav.modelId)) merged.push(fav);
+  }
+  const { antigravityCliFavoriteModels: _models, antigravityCliFavoritesHintShown: _hint, ...rest } = legacy;
+  const next: UserPreferences = merged.length > 0 ? { ...rest, favoriteModels: merged } : rest;
+  writeConfig(next);
+  return next;
+}
+
+function writeConfig(config: UserPreferences): void {
+  const configPath = getConfigPath();
+  mkdirSync(dirname(configPath), { recursive: true, mode: 0o700 });
+  writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+}
+
+export function loadPreferences(): UserPreferences {
+  const config = readConfig();
+  const lastProvider =
+    config.lastProvider === 'opencode' ? 'zen' : config.lastProvider;
+  return {
+    lastBackend: config.lastBackend,
+    lastModel: config.lastModel,
+    lastProvider,
+    lastCodexProvider: config.lastCodexProvider,
+    lastCodexModel: config.lastCodexModel,
+    lastGeminiProvider: config.lastGeminiProvider,
+    lastGeminiModel: config.lastGeminiModel,
+    lastAntigravityProvider: config.lastAntigravityProvider,
+    lastAntigravityModel: config.lastAntigravityModel,
+    lastClaudeTransparentMode: config.lastClaudeTransparentMode,
+    recentModelsByProvider: config.recentModelsByProvider,
+    favoriteModels: config.favoriteModels,
+    codexSubagentModels: Array.isArray(config.codexSubagentModels)
+      ? config.codexSubagentModels.slice(0, CODEX_SUBAGENT_MODEL_CAP)
+      : undefined,
+    appPathOverrides: config.appPathOverrides,
+    recentLaunchFolders: config.recentLaunchFolders,
+    server: config.server,
+  };
+}
+
+export function savePreferences(prefs: Partial<Pick<UserPreferences, 'lastBackend' | 'lastModel' | 'lastProvider' | 'lastCodexProvider' | 'lastCodexModel' | 'lastGeminiProvider' | 'lastGeminiModel' | 'lastAntigravityProvider' | 'lastAntigravityModel' | 'lastClaudeTransparentMode' | 'recentModelsByProvider' | 'favoriteModels' | 'codexSubagentModels' | 'appPathOverrides' | 'recentLaunchFolders'>>): void {
+  const config = readConfig();
+  if (prefs.lastBackend !== undefined) config.lastBackend = prefs.lastBackend;
+  if (prefs.lastModel !== undefined) config.lastModel = prefs.lastModel;
+  if (prefs.lastProvider !== undefined) config.lastProvider = prefs.lastProvider;
+  if (prefs.lastCodexProvider !== undefined) config.lastCodexProvider = prefs.lastCodexProvider;
+  if (prefs.lastCodexModel !== undefined) config.lastCodexModel = prefs.lastCodexModel;
+  if (prefs.lastGeminiProvider !== undefined) config.lastGeminiProvider = prefs.lastGeminiProvider;
+  if (prefs.lastGeminiModel !== undefined) config.lastGeminiModel = prefs.lastGeminiModel;
+  if (prefs.lastAntigravityProvider !== undefined) config.lastAntigravityProvider = prefs.lastAntigravityProvider;
+  if (prefs.lastAntigravityModel !== undefined) config.lastAntigravityModel = prefs.lastAntigravityModel;
+  if (prefs.lastClaudeTransparentMode !== undefined) config.lastClaudeTransparentMode = prefs.lastClaudeTransparentMode;
+  if (prefs.recentModelsByProvider !== undefined) config.recentModelsByProvider = prefs.recentModelsByProvider;
+  if (prefs.favoriteModels !== undefined) config.favoriteModels = prefs.favoriteModels;
+  if (prefs.codexSubagentModels !== undefined) {
+    config.codexSubagentModels = prefs.codexSubagentModels.slice(0, CODEX_SUBAGENT_MODEL_CAP);
+  }
+  if (prefs.appPathOverrides !== undefined) config.appPathOverrides = prefs.appPathOverrides;
+  if (prefs.recentLaunchFolders !== undefined) config.recentLaunchFolders = prefs.recentLaunchFolders;
+  writeConfig(config);
+}
+
+export function getAppPathOverride(appId: string): string | undefined {
+  const value = loadPreferences().appPathOverrides?.[appId];
+  return typeof value === 'string' && value.trim() ? value : undefined;
+}
+
+export function setAppPathOverride(appId: string, path: string | null): Record<string, string> {
+  const config = readConfig();
+  const next = { ...(config.appPathOverrides ?? {}) };
+  const trimmed = path?.trim() ?? '';
+  if (trimmed) next[appId] = trimmed;
+  else delete next[appId];
+  config.appPathOverrides = next;
+  if (Object.keys(next).length === 0) delete config.appPathOverrides;
+  writeConfig(config);
+  return next;
+}
+
+const MAX_RECENT_MODELS = 3;
+const MAX_RECENT_LAUNCH_FOLDERS = 6;
+
+export function recordLaunchFolder(folder: string): string[] {
+  const trimmed = folder.trim();
+  if (!trimmed) return loadPreferences().recentLaunchFolders ?? [];
+  const config = readConfig();
+  const prev = config.recentLaunchFolders ?? [];
+  const next = [trimmed, ...prev.filter(path => path !== trimmed)].slice(0, MAX_RECENT_LAUNCH_FOLDERS);
+  config.recentLaunchFolders = next;
+  writeConfig(config);
+  return next;
+}
+
+export function recordLaunchSelection(
+  agent: 'claude' | 'codex' | 'gemini',
+  providerId: string,
+  modelId: string,
+  prefs: UserPreferences,
+): void {
+  const prevRecent = prefs.recentModelsByProvider?.[providerId] ?? [];
+  const updatedRecent = [modelId, ...prevRecent.filter(id => id !== modelId)].slice(0, MAX_RECENT_MODELS);
+  savePreferences({
+    ...(agent === 'claude'
+      ? { lastProvider: providerId, lastModel: modelId }
+      : agent === 'codex'
+      ? { lastCodexProvider: providerId, lastCodexModel: modelId }
+      : { lastGeminiProvider: providerId, lastGeminiModel: modelId }),
+    recentModelsByProvider: { ...prefs.recentModelsByProvider, [providerId]: updatedRecent },
+  });
+}
+
+const SERVER_PASSWORD_SERVICE = 'relay-ai-server-password';
+const SERVER_PASSWORD_ACCOUNT = 'server-password';
+
+async function getServerPasswordKeyring(): Promise<any | null> {
+  try {
+    const { openEntry } = await import("./secrets-backend.js");
+    return await openEntry(SERVER_PASSWORD_SERVICE, SERVER_PASSWORD_ACCOUNT);
+  } catch {
+    return null;
+  }
+}
+
+export async function getSavedServerPassword(): Promise<string | null> {
+  const config = readConfig();
+  if (config.server?.savedPassword) {
+    const pwd = config.server.savedPassword;
+    const keyring = await getServerPasswordKeyring();
+    if (keyring) {
+      try {
+        await keyring.setPassword(pwd);
+        delete config.server.savedPassword;
+        if (Object.keys(config.server).length === 0) delete config.server;
+        writeConfig(config);
+      } catch {
+        // Fallback: keep in config.json if keyring fails
+      }
+    }
+    return pwd;
+  }
+
+  const keyring = await getServerPasswordKeyring();
+  if (keyring) {
+    try {
+      return await keyring.getPassword();
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Network gateway password from env (Docker / Compose / quick-start). Never log this. */
+export function getEnvServerPassword(): string | null {
+  const value = process.env['RELAY_AI_SERVER_PASSWORD']?.trim();
+  return value || null;
+}
+
+/** Prefer RELAY_AI_SERVER_PASSWORD, then a saved password. */
+export async function resolveConfiguredServerPassword(): Promise<string | null> {
+  return getEnvServerPassword() ?? (await getSavedServerPassword());
+}
+
+export async function setSavedServerPassword(password: string): Promise<void> {
+  const keyring = await getServerPasswordKeyring();
+  if (keyring) {
+    try {
+      await keyring.setPassword(password);
+      return;
+    } catch {
+      // Fallback
+    }
+  }
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    savedPassword: password,
+  };
+  writeConfig(config);
+}
+
+export async function clearSavedServerPassword(): Promise<void> {
+  const keyring = await getServerPasswordKeyring();
+  if (keyring) {
+    try {
+      await keyring.deletePassword();
+    } catch {
+      // Ignore
+    }
+  }
+  const config = readConfig();
+  if (!config.server) return;
+  delete config.server.savedPassword;
+  if (Object.keys(config.server).length === 0) delete config.server;
+  writeConfig(config);
+}
+
+export function getServerExposedProviders(): string[] | null {
+  const list = readConfig().server?.exposedProviders;
+  return list && list.length > 0 ? list : null;
+}
+
+export function setServerExposedProviders(providerIds: string[]): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    exposedProviders: providerIds,
+  };
+  writeConfig(config);
+}
+
+export function getServerMaskGatewayIds(): boolean {
+  return readConfig().server?.maskGatewayIds ?? true;
+}
+
+export function setServerMaskGatewayIds(mask: boolean): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    maskGatewayIds: mask,
+  };
+  writeConfig(config);
+}
+
+export function getServerFavoritesOnly(): boolean {
+  return readConfig().server?.favoritesOnly ?? false;
+}
+
+export function setServerFavoritesOnly(favoritesOnly: boolean): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    favoritesOnly,
+  };
+  writeConfig(config);
+}
+
+export function getServerFreeModelsOnly(): boolean {
+  return readConfig().server?.freeModelsOnly ?? false;
+}
+
+export function setServerFreeModelsOnly(freeModelsOnly: boolean): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    freeModelsOnly,
+  };
+  writeConfig(config);
+}
+
+export function getServerListenMode(): 'local' | 'network' {
+  return readConfig().server?.listenMode === 'network' ? 'network' : 'local';
+}
+
+export function setServerListenMode(listenMode: 'local' | 'network'): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    listenMode,
+  };
+  writeConfig(config);
+}
+
+export function getServerAutostart(): boolean {
+  return readConfig().server?.autostart ?? false;
+}
+
+export function setServerAutostart(autostart: boolean): void {
+  const config = readConfig();
+  config.server = {
+    ...(config.server ?? {}),
+    autostart,
+  };
+  writeConfig(config);
+}
+
+/** Check RELAY_AI_SERVER_AUTOSTART env var first, then config preference. */
+export function resolveServerAutostart(env: NodeJS.ProcessEnv = process.env): boolean {
+  const envVal = env['RELAY_AI_SERVER_AUTOSTART']?.trim().toLowerCase();
+  if (envVal !== undefined && envVal !== '') {
+    return ['1', 'true', 'yes', 'on'].includes(envVal);
+  }
+  return getServerAutostart();
+}
