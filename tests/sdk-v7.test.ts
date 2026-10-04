@@ -7,13 +7,13 @@ import { resolve } from 'node:path';
 const require = createRequire(import.meta.url);
 const pkg = JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8')) as {
   dependencies: Record<string, string>;
-  engines: { node: string };
+  engines: { bun: string };
 };
 
 describe('AI SDK v7 (issue #71)', () => {
-  it('declares ai ^7 and Node 22+', () => {
+  it('declares ai ^7 and bun >=1.4 (bun-only runtime)', () => {
     expect(pkg.dependencies.ai).toMatch(/^\^7/);
-    expect(pkg.engines.node).toMatch(/22/);
+    expect(pkg.engines.bun).toMatch(/^>=1/);
   });
 
   it('resolves the ai package to 7.x, not a nested 6.x tree', () => {
