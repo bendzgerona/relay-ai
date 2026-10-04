@@ -34,7 +34,8 @@
     "README.md"
   ],
   "engines": {
-    "bun": ">=1.4"
+    "bun": ">=1.4",
+    "node": ">=22"
   },
   "scripts": {
     "build": "bun node_modules/.bin/tsup && bun node_modules/.bin/tsup --config tsup.core.config.ts && bun scripts/copy-ui-assets.mjs && bun scripts/fix-shebangs.mjs",
