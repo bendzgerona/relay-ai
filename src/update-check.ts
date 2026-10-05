@@ -12,9 +12,9 @@ import { getAppHome } from './paths.js';
 
 export const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
 export const UPDATE_CHECK_TIMEOUT_MS = 2_000;
-export const UPDATE_COMMAND = 'npm install -g @jacobbd/relay-ai@latest';
+export const UPDATE_COMMAND = 'npm install -g @bendzgerona/relay-ai@latest';
 
-const REGISTRY_URL = 'https://registry.npmjs.org/@jacobbd%2Frelay-ai/latest';
+const REGISTRY_URL = 'https://registry.npmjs.org/@bendzgerona%2Frelay-ai/latest';
 const SEMVER_PATTERN = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
 
 interface ParsedVersion {

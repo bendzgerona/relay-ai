@@ -9,7 +9,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ store: new Map<string, string>(), gets: 0, sets: 0, deletes: 0 }));
 
-vi.mock('@napi-rs/keyring', () => ({
+vi.mock('../src/secrets-backend.js', () => ({
   Entry: class {
     #account: string;
     constructor(_service: string, account: string) {

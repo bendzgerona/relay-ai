@@ -17,7 +17,7 @@ const UPSTREAM_MODEL = 'gemini-3.7-flash-high';
 const TOOL_SIGNATURE = 'thought-sig-tool-abc';
 const THINK_SIGNATURE = 'thought-sig-think-xyz';
 
-vi.mock('@napi-rs/keyring', () => ({
+vi.mock('../src/secrets-backend.js', () => ({
   Entry: class {
     constructor() { throw new Error('keyring unavailable in test'); }
   },

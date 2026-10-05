@@ -128,7 +128,6 @@ describe('provider templates', () => {
   it('lists only visible OAuth templates for discovery surfaces', () => {
     expect(listVisibleOAuthTemplates().map(t => t.id).sort()).toEqual([
       'github-copilot',
-      'kiro',
       'openai-oauth',
       'xai-oauth',
     ]);

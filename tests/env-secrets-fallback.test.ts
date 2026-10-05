@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-vi.mock('@napi-rs/keyring', () => ({
+vi.mock('../src/secrets-backend.js', () => ({
   Entry: class Entry {
     getPassword(): string | null {
       throw new Error('Secret Service error: no daemon running');

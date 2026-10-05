@@ -1,0 +1,9 @@
+#!/bin/sh
+# Auto-heal: after any merge (e.g. `git pull upstream`), re-apply the
+# @napi-rs/keyring -> src/secrets-backend.js specifier rewrite so the
+# pure-Bun/Termux build never ships the un-loadable native NAPI addon.
+# Idempotent + silent; the patcher logs "OK:" when there is nothing to do.
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+SCRIPT="$ROOT/scripts/patch-napi-keyring.mjs"
+[ -f "$SCRIPT" ] && bun "$SCRIPT" apply >/dev/null 2>&1 || true
+exit 0

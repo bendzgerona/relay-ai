@@ -147,13 +147,7 @@ var init_provider_templates = __esm({
         npm: "@ai-sdk/openai-compatible",
         defaultBaseUrl: "https://open.bigmodel.cn/api/paas/v4",
         signupUrl: "https://open.bigmodel.cn",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "glm-4.5-flash", name: "GLM-4.5 Flash (Free)" },
-          { id: "glm-4.5-air", name: "GLM-4.5 Air (Free)" },
-          { id: "glm-4-flash", name: "GLM-4 Flash (Free)" },
-          { id: "glm-4-air", name: "GLM-4 Air (Free)" }
-        ],
+        modelSource: "api-list",
         supported: true
       },
       {
@@ -278,20 +272,6 @@ var init_provider_templates = __esm({
         defaultBaseUrl: "https://openrouter.ai/api/v1",
         signupUrl: "https://openrouter.ai/keys",
         modelSource: "api-list",
-        supported: true
-      },
-      {
-        id: "zai",
-        name: "ZAI (GLM)",
-        authType: "api",
-        npm: "@ai-sdk/openai-compatible",
-        defaultBaseUrl: "https://api.z.ai/v1",
-        signupUrl: "https://z.ai",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "glm-4.5-flash", name: "GLM-4.5 Flash (Free)" },
-          { id: "glm-4.7-flash", name: "GLM-4.7 Flash (Free)" }
-        ],
         supported: true
       },
       {
@@ -446,79 +426,6 @@ var init_provider_templates = __esm({
         hidden: true,
         subscriptionRisk: true
       },
-      // Additional API-key providers
-      {
-        id: "nous",
-        name: "Nous Research",
-        authType: "api",
-        authMethods: ["api", "oauth"],
-        npm: "@ai-sdk/openai-compatible",
-        defaultBaseUrl: "https://api.nousresearch.com/v1",
-        signupUrl: "https://nousresearch.com",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "hermes-3-70b", name: "Hermes 3 70B" },
-          { id: "nemotron-3-ultra", name: "Nemotron 3 Ultra" }
-        ],
-        supported: true
-      },
-      {
-        id: "pollinations",
-        name: "Pollinations",
-        authType: "api",
-        npm: "@ai-sdk/openai-compatible",
-        defaultBaseUrl: "https://text.pollinations.ai/openai",
-        signupUrl: "https://pollinations.ai",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "gpt-3.5-turbo", name: "GPT-3.5 Turbo (Free)" },
-          { id: "gpt-4", name: "GPT-4 (Free)" }
-        ],
-        supported: true,
-        apiKeyOptional: true,
-        anonymousFreeModels: true
-      },
-      {
-        id: "kiro",
-        name: "Kiro (AWS CodeWhisperer/Q)",
-        shortName: "Kiro",
-        authType: "oauth",
-        npm: "@ai-sdk/openai-compatible",
-        defaultBaseUrl: "https://api.kimi.com/coding/v1",
-        signupUrl: "https://kiro.ai",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "kiro-code", name: "Kiro Code" }
-        ],
-        supported: true
-      },
-      {
-        id: "atuin",
-        name: "Atuin AI Hub",
-        authType: "api",
-        npm: "@ai-sdk/openai-compatible",
-        defaultBaseUrl: "https://hub.atuin.sh",
-        signupUrl: "https://hub.atuin.sh",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "atuin-chat", name: "Atuin Chat" }
-        ],
-        supported: true,
-        apiKeyOptional: false
-      },
-      {
-        id: "poolside",
-        name: "Poolside",
-        authType: "api",
-        npm: "@ai-sdk/openai-compatible",
-        defaultBaseUrl: "https://inference.poolside.ai/v1",
-        signupUrl: "https://poolside.ai",
-        modelSource: "static-seed",
-        staticModels: [
-          { id: "poolside-code", name: "Poolside Code" }
-        ],
-        supported: true
-      },
       // OAuth-gated subscription providers — device code or broker sign-in
       {
         id: "xai-oauth",
@@ -566,4 +473,4 @@ export {
   provider_templates_exports,
   init_provider_templates
 };
-//# sourceMappingURL=chunk-Q7BD5SC2.js.map
+//# sourceMappingURL=chunk-UGHIPGUW.js.map

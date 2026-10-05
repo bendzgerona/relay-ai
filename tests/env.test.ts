@@ -29,6 +29,11 @@ describe('classifyKeyringError', () => {
     expect(classifyKeyringError(new Error('daemon not available'))).toContain('Secret Service daemon');
   });
 
+  it('identifies passage store problems', () => {
+    expect(classifyKeyringError(new Error('passage secret store not available'))).toContain('passage');
+    expect(classifyKeyringError(new Error('passage insert failed for relay-ai/provider:groq'))).toContain('passage');
+  });
+
   it('identifies permission denied / locked keychain', () => {
     expect(classifyKeyringError(new Error('access denied by user'))).toContain('denied');
     expect(classifyKeyringError(new Error('keychain is locked'))).toContain('denied');

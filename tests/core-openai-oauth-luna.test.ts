@@ -28,7 +28,7 @@ class FakeWebSocket extends EventEmitter {
 
 vi.mock('ws', () => ({ WebSocket: FakeWebSocket, default: FakeWebSocket }));
 
-vi.mock('@napi-rs/keyring', () => ({
+vi.mock('../src/secrets-backend.js', () => ({
   Entry: class {
     constructor() { throw new Error('keyring unavailable in test'); }
   },

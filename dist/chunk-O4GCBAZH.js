@@ -44,7 +44,9 @@ var package_default = {
     bun: ">=1.4"
   },
   scripts: {
-    build: "bun node_modules/.bin/tsup && bun node_modules/.bin/tsup --config tsup.core.config.ts && bun scripts/copy-ui-assets.mjs && bun scripts/fix-shebangs.mjs",
+    build: "bun scripts/patch-napi-keyring.mjs apply && bun node_modules/.bin/tsup && bun node_modules/.bin/tsup --config tsup.core.config.ts && bun scripts/copy-ui-assets.mjs && bun scripts/fix-shebangs.mjs",
+    "patch:keyring": "bun scripts/patch-napi-keyring.mjs apply",
+    "verify:keyring": "bun scripts/patch-napi-keyring.mjs check",
     "build:publish": "tsup && tsup --config tsup.core.config.ts && node scripts/copy-ui-assets.mjs",
     dev: "tsup --watch",
     test: 'vitest run --exclude "tests/debug-*.test.ts"',
@@ -367,8 +369,8 @@ var SERVER_PASSWORD_SERVICE = "relay-ai-server-password";
 var SERVER_PASSWORD_ACCOUNT = "server-password";
 async function getServerPasswordKeyring() {
   try {
-    const { openEntry } = await import("./secrets-backend-U6KCA3C6.js");
-    return await openEntry(SERVER_PASSWORD_SERVICE, SERVER_PASSWORD_ACCOUNT);
+    const { Entry } = await import("./secrets-backend-DIUCUO5Y.js");
+    return new Entry(SERVER_PASSWORD_SERVICE, SERVER_PASSWORD_ACCOUNT);
   } catch {
     return null;
   }
@@ -536,4 +538,4 @@ export {
   setServerAutostart,
   resolveServerAutostart
 };
-//# sourceMappingURL=chunk-HGNBZNEG.js.map
+//# sourceMappingURL=chunk-O4GCBAZH.js.map

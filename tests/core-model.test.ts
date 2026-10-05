@@ -8,7 +8,7 @@ const CANARY = 'sk-canary-oauth-token-zzz';
 
 // OS keyring unavailable in tests → credential store falls back to secrets.json
 // under the temp RELAY_AI_HOME.
-vi.mock('@napi-rs/keyring', () => ({
+vi.mock('../src/secrets-backend.js', () => ({
   Entry: class {
     constructor() { throw new Error('keyring unavailable in test'); }
   },

@@ -38,7 +38,6 @@ import { runProvidersCommand, providersHelpText } from './providers-command.js';
 import { runCodexCommand, codexHelpText } from './codex.js';
 import { runGeminiCommand, geminiHelpText } from './gemini.js';
 import { runAgyCommand, runAntigravityAppCommand, runAntigravityIdeCommand } from './antigravity.js';
-import { runPiCommand, piHelpText } from './pi.js';
 import { runCodexAppCommand, codexAppHelpText } from './codex-app.js';
 import { runClaudeAppCommand, claudeAppHelpText } from './claude-app.js';
 import { prepareClaudeTraceLog, prepareProviderTraceLog, printTraceLog } from './trace-log.js';
@@ -314,25 +313,6 @@ export function parseArgs(args: string[]): ParsedArgs {
     return parsed;
   }
 
-  if (first === 'pi') {
-    const parsed = emptyParsed('pi');
-    for (let i = 0; i < rest.length; i += 1) {
-      const arg = rest[i]!;
-      if (arg === '--trace') { parsed.trace = true; continue; }
-      if (arg === '--help' || arg === '-h') { parsed.showHelp = true; continue; }
-      if (arg === '--version' || arg === '-v') { parsed.showVersion = true; continue; }
-      if (arg === '--dry-run') { parsed.dryRun = true; continue; }
-      const consumed = tryConsumeRelayLaunchFlag(arg, rest, i, parsed);
-      if (consumed !== null) {
-        if ('error' in consumed) return parsed;
-        i = consumed.next;
-        continue;
-      }
-      parsed.claudeArgs.push(arg);
-    }
-    return parsed;
-  }
-
   if (first === 'codex') {
     const parsed = emptyParsed('codex');
     for (let i = 0; i < rest.length; i += 1) {
@@ -515,7 +495,8 @@ ${pc.bold('Usage:')}
   relay-ai gemini [options] [gemini-flags]
   relay-ai agy [options] [agy-flags]
   relay-ai antigravity [options]
-  relay-ai antigravity-ide [options]\n  relay-ai pi [options] [pi-flags]\n  relay-ai server [options]
+  relay-ai antigravity-ide [options]
+  relay-ai server [options]
   relay-ai ui
   relay-ai models
   relay-ai favorites
@@ -1871,18 +1852,6 @@ Options:
       launchProvider: parsed.launchProvider,
       launchModel: parsed.launchModel,
     });
-  }
-
-  if (parsed.command === 'pi') {
-    if (parsed.showVersion) {
-      console.log(VERSION);
-      return 0;
-    }
-    if (parsed.showHelp) {
-      console.log(piHelpText());
-      return 0;
-    }
-    return runPiCommand(parsed);
   }
 
   if (parsed.showVersion) {

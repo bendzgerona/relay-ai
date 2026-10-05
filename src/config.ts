@@ -188,8 +188,8 @@ const SERVER_PASSWORD_ACCOUNT = 'server-password';
 
 async function getServerPasswordKeyring(): Promise<any | null> {
   try {
-    const { openEntry } = await import("./secrets-backend.js");
-    return await openEntry(SERVER_PASSWORD_SERVICE, SERVER_PASSWORD_ACCOUNT);
+    const { Entry } = await import('./secrets-backend.js');
+    return new Entry(SERVER_PASSWORD_SERVICE, SERVER_PASSWORD_ACCOUNT);
   } catch {
     return null;
   }

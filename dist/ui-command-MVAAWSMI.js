@@ -40,7 +40,7 @@ import {
   supportsClaudeTransparentMode,
   updateCustomEndpointProvider,
   writeSecureLogLine
-} from "./chunk-B6HWTWRR.js";
+} from "./chunk-WXLAKPCH.js";
 import {
   findBinaryOnPath
 } from "./chunk-74BCMX4U.js";
@@ -49,7 +49,7 @@ import {
   listAddableTemplates,
   listVisibleOAuthTemplates,
   provider_templates_exports
-} from "./chunk-Q7BD5SC2.js";
+} from "./chunk-UGHIPGUW.js";
 import {
   buildAntigravityAuthUrl,
   completeAntigravityExchange,
@@ -72,7 +72,7 @@ import {
   saveProviderCredential,
   supportsManualModels,
   validateCustomEndpointUrl
-} from "./chunk-BTGODHIT.js";
+} from "./chunk-YIWGWBXP.js";
 import {
   BACKENDS,
   CODEX_SUBAGENT_MODEL_CAP,
@@ -99,7 +99,7 @@ import {
   setServerFreeModelsOnly,
   setServerListenMode,
   setServerMaskGatewayIds
-} from "./chunk-HGNBZNEG.js";
+} from "./chunk-O4GCBAZH.js";
 import {
   __toCommonJS
 } from "./chunk-V3ZZ5J5M.js";
@@ -871,7 +871,7 @@ async function handleManualModel(req, res, action) {
     return;
   }
   try {
-    const { addManualModel, removeManualModel } = await import("./manual-models-BGTE2UBZ.js");
+    const { addManualModel, removeManualModel } = await import("./manual-models-HT6BOC4E.js");
     const result = action === "add" ? await addManualModel({
       providerId: providerId.trim(),
       modelId: modelId.trim(),
@@ -1049,7 +1049,7 @@ async function handleAddProvider(req, res) {
       sendJson(res, 400, { error: "templateId required" });
       return;
     }
-    const { listSupportedTemplates } = await import("./provider-templates-NGZVOBNY.js");
+    const { listSupportedTemplates } = await import("./provider-templates-3MH7MCSW.js");
     const template = listSupportedTemplates().find((t) => t.id === templateId);
     if (!template) {
       sendJson(res, 404, { error: `Template '${templateId}' not found` });
@@ -1900,4 +1900,4 @@ export {
   resolveUiShutdownDecision,
   runUiCommand
 };
-//# sourceMappingURL=ui-command-G2IQQJVY.js.map
+//# sourceMappingURL=ui-command-MVAAWSMI.js.map

@@ -106,11 +106,11 @@ export function classifyKeyringError(err: unknown): string {
   if (lower.includes('secret service') || lower.includes('dbus') || lower.includes('daemon')) {
     return 'Secret Service daemon is not running (start GNOME Keyring or KWallet)';
   }
+  if (lower.includes('passage')) {
+    return 'passage secret store unavailable — check PASSAGE_IDENTITIES_FILE and `passage list`';
+  }
   if (lower.includes('denied') || lower.includes('locked') || lower.includes('cancelled') || lower.includes('user refused')) {
     return 'keychain access was denied or the keychain is locked';
-  }
-  if (lower.includes('passage')) {
-    return 'passage store unavailable — check PASSAGE_IDENTITIES_FILE and `passage list`';
   }
   return `keyring error: ${msg}`;
 }
@@ -205,16 +205,13 @@ async function readOsKeyringAccount(account: string, diag?: (msg: string) => voi
   if (cached) return cached;
   const read = (async (): Promise<string | null> => {
     try {
-      const { openEntry } = await import("./secrets-backend.js");
-      const entry = await openEntry(KEYRING_SERVICE, account);
-      if (!entry) return null;
-      const value = (await entry.getPassword()) ?? null;
+      const { Entry } = await import('./secrets-backend.js');
+      const value = new Entry(KEYRING_SERVICE, account).getPassword() ?? null;
       if (!value?.startsWith(KEYRING_CHUNK_PREFIX)) return value;
       const chunkCount = Number(value.slice(KEYRING_CHUNK_PREFIX.length));
-      let combined = "";
+      let combined = '';
       for (let i = 0; i < chunkCount; i++) {
-        const chunk = await openEntry(KEYRING_SERVICE, `${account}::chunk::${i}`);
-        combined += (await chunk?.getPassword()) ?? "";
+        combined += new Entry(KEYRING_SERVICE, `${account}::chunk::${i}`).getPassword() ?? '';
       }
       return combined;
     } catch (err) {
@@ -232,21 +229,17 @@ async function writeOsKeyringAccount(
   diag?: (msg: string) => void,
 ): Promise<boolean> {
   try {
-    const { openEntry } = await import("./secrets-backend.js");
-    const entry = await openEntry(KEYRING_SERVICE, account);
-    if (!entry) return false;
+    const { Entry } = await import('./secrets-backend.js');
     if (key.length <= KEYRING_CHUNK_SIZE) {
-      await entry.setPassword(key);
+      new Entry(KEYRING_SERVICE, account).setPassword(key);
       return true;
     }
     const chunkCount = Math.ceil(key.length / KEYRING_CHUNK_SIZE);
     for (let i = 0; i < chunkCount; i++) {
       const chunk = key.slice(i * KEYRING_CHUNK_SIZE, (i + 1) * KEYRING_CHUNK_SIZE);
-      const chunkEntry = await openEntry(KEYRING_SERVICE, `${account}::chunk::${i}`);
-      if (!chunkEntry) return false;
-      await chunkEntry.setPassword(chunk);
+      new Entry(KEYRING_SERVICE, `${account}::chunk::${i}`).setPassword(chunk);
     }
-    await entry.setPassword(`${KEYRING_CHUNK_PREFIX}${chunkCount}`);
+    new Entry(KEYRING_SERVICE, account).setPassword(`${KEYRING_CHUNK_PREFIX}${chunkCount}`);
     return true;
   } catch (err) {
     diag?.(classifyKeyringError(err));
@@ -256,18 +249,15 @@ async function writeOsKeyringAccount(
 
 async function deleteOsKeyringAccount(account: string, diag?: (msg: string) => void): Promise<boolean> {
   try {
-    const { openEntry } = await import("./secrets-backend.js");
-    const entry = await openEntry(KEYRING_SERVICE, account);
-    if (!entry) return false;
-    const value = await entry.getPassword();
+    const { Entry } = await import('./secrets-backend.js');
+    const value = new Entry(KEYRING_SERVICE, account).getPassword();
     if (value?.startsWith(KEYRING_CHUNK_PREFIX)) {
       const chunkCount = Number(value.slice(KEYRING_CHUNK_PREFIX.length));
       for (let i = 0; i < chunkCount; i++) {
-        const chunkEntry = await openEntry(KEYRING_SERVICE, `${account}::chunk::${i}`);
-        await chunkEntry?.deletePassword();
+        new Entry(KEYRING_SERVICE, `${account}::chunk::${i}`).deletePassword();
       }
     }
-    await entry.deletePassword();
+    new Entry(KEYRING_SERVICE, account).deletePassword();
     return true;
   } catch (err) {
     diag?.(classifyKeyringError(err));
@@ -327,9 +317,8 @@ export async function readGlobalOpencodeCredential(diag?: (msg: string) => void)
   if (current) return current;
 
   try {
-    const { openEntry } = await import("./secrets-backend.js");
-    const legacy = await openEntry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT);
-    return (await legacy?.getPassword()) ?? null;
+    const { Entry } = await import('./secrets-backend.js');
+    return new Entry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT).getPassword() ?? null;
   } catch (err) {
     diag?.(classifyKeyringError(err));
     return null;
@@ -358,9 +347,8 @@ export async function migrateGlobalOpencodeCredential(diag?: (msg: string) => vo
     (await readKeyringAccount(KEYRING_ACCOUNT, diag)) ??
     (await (async () => {
       try {
-        const { openEntry } = await import("./secrets-backend.js");
-        const legacy = await openEntry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT);
-        return (await legacy?.getPassword()) ?? null;
+        const { Entry } = await import('./secrets-backend.js');
+        return new Entry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT).getPassword() ?? null;
       } catch (err) {
         diag?.(classifyKeyringError(err));
         return null;
@@ -382,10 +370,9 @@ export async function migrateGlobalOpencodeCredential(diag?: (msg: string) => vo
     await deleteKeyringAccount(KEYRING_ACCOUNT, diag);
   }
   try {
-    const { openEntry } = await import("./secrets-backend.js");
-    const legacy = await openEntry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT);
-    if (await legacy?.getPassword()) {
-      await legacy?.deletePassword();
+    const { Entry } = await import('./secrets-backend.js');
+    if (new Entry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT).getPassword()) {
+      new Entry(LEGACY_KEYRING_SERVICE, LEGACY_KEYRING_ACCOUNT).deletePassword();
     }
   } catch {
     // best-effort legacy cleanup
@@ -597,8 +584,9 @@ export async function saveToCredentialStore(key: string, diag?: (msg: string) =>
 
 export async function isSecretServiceAvailable(): Promise<boolean> {
   try {
-    const { isSecretStoreAvailable } = await import("./secrets-backend.js");
-    return await isSecretStoreAvailable();
+    const { Entry } = await import('./secrets-backend.js');
+    new Entry(`${KEYRING_SERVICE}-probe`, 'probe').getPassword();
+    return true;
   } catch {
     return false;
   }

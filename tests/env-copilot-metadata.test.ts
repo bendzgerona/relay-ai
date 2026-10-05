@@ -4,7 +4,7 @@ const state = vi.hoisted(() => ({
   passwords: new Map<string, string>(),
 }));
 
-vi.mock('@napi-rs/keyring', () => ({
+vi.mock('../src/secrets-backend.js', () => ({
   Entry: class Entry {
     private readonly key: string;
 

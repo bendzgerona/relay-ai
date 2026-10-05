@@ -1,72 +1,88 @@
-// src/secrets-backend.ts — vendored secret store for the Termux/Android build.
+// src/secrets-backend.ts — vendored secret store for the pure-Bun/Termux build.
 //
-// bun-only runtime, no fallback chain: secrets go straight to the `passage`
-// CLI (age file store, daemon-free). passage is an APT/pkg package
-// (`pkg install passage`) — not npm — and is the only secret store on Termux,
-// which has no OS keychain / Secret Service daemon. Entries live at
-// `<service>/<account>` (e.g. `relay-ai/provider:groq`,
-// `relay-ai-server-password/server-password`).
+// relay-ai targets Bun (>=1.4) with no NAPI native addons. @napi-rs/keyring
+// ships a native keytar binding that cannot load under pure Bun, and Bun.secrets
+// relies on a D-Bus Secret Service daemon that isn't running on Android/Termux.
+// `passage` (the 1Password age-backed password-store, `pkg install passage`)
+// is the only secret store available here.
+//
+// The `Entry` class below mirrors @napi-rs/keyring's *synchronous* API
+// (new Entry(service, account).getPassword/setPassword/deletePassword), so a
+// specifier rewrite from `@napi-rs/keyring` to `./secrets-backend.js` is the
+// only change required to swap the backend. `scripts/patch-napi-keyring.mjs`
+// applies that rewrite automatically after every upstream sync.
 
-import { spawnSync } from "node:child_process";
+import { spawnSync } from 'node:child_process';
 
-export type SecretBackendKind = "passage";
+export type SecretBackendKind = 'passage';
 
-export interface SecretEntry {
-  readonly backend: SecretBackendKind;
-  getPassword(): Promise<string | null>;
-  setPassword(password: string): Promise<void>;
-  deletePassword(): Promise<void>;
+interface SpawnResult {
+  ok: boolean;
+  out: string;
+  err: string;
 }
 
-function passageRun(args: string[], input?: string): { ok: boolean; out: string } {
+function passageRun(args: string[], input?: string): SpawnResult {
   try {
-    const r = spawnSync("passage", args, {
+    const r = spawnSync('passage', args, {
       input,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "ignore"],
+      encoding: 'utf8',
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-    return { ok: r.status === 0, out: (r.stdout as string ?? "").trim() };
-  } catch {
-    return { ok: false, out: "" };
+    return {
+      ok: r.status === 0,
+      out: (r.stdout ?? '').trim(),
+      err: (r.stderr ?? '').trim(),
+    };
+  } catch (e) {
+    return { ok: false, out: '', err: e instanceof Error ? e.message : String(e) };
   }
 }
 
-function passageAvailable(): boolean {
-  return passageRun(["version"]).ok || passageRun(["list"]).ok;
+export function isSecretStoreAvailable(): boolean {
+  return passageRun(['version']).ok || passageRun(['list']).ok;
 }
 
-function tryPassage(service: string, account: string): SecretEntry | null {
-  if (!passageAvailable()) return null;
-  const name = `${service}/${account}`;
-  return {
-    backend: "passage",
-    getPassword: async () => {
-      const r = passageRun(["show", name]);
-      return r.ok && r.out ? r.out : null;
-    },
-    setPassword: async (password: string) => {
-      const r = passageRun(["insert", "--force", "--echo", name], password);
-      if (!r.ok) throw new Error(`passage insert failed for ${name}`);
-    },
-    deletePassword: async () => {
-      passageRun(["rm", "--force", name]); // best-effort: absent entries are fine
-    },
-  };
-}
+/** @napi-rs/keyring-compatible Entry — backed by the passage CLI. */
+export class Entry {
+  readonly service: string;
+  readonly account: string;
 
-/** passage is the only store on Termux; null means the `passage` CLI is missing. */
-export async function openEntry(service: string, account: string): Promise<SecretEntry | null> {
-  return tryPassage(service, account);
-}
+  constructor(service: string, account: string) {
+    this.service = service;
+    this.account = account;
+  }
 
-/** True when the passage CLI answers (used for capability diagnostics). */
-export async function isSecretStoreAvailable(): Promise<boolean> {
-  const probe = await openEntry("relay-ai-probe", "probe");
-  if (!probe) return false;
-  try {
-    await probe.getPassword();
-    return true;
-  } catch {
-    return false;
+  /** passage stores entries as `<service>/<account>` path segments. */
+  private get name(): string {
+    return `${this.service}/${this.account}`;
+  }
+
+  /** @returns the secret, or null when the entry does not exist. */
+  getPassword(): string | null {
+    if (!isSecretStoreAvailable()) {
+      throw new Error('passage secret store not available');
+    }
+    const r = passageRun(['show', this.name]);
+    if (!r.ok || !r.out) return null;
+    return r.out;
+  }
+
+  setPassword(password: string): void {
+    if (!isSecretStoreAvailable()) {
+      throw new Error('passage secret store not available');
+    }
+    const r = passageRun(['insert', '--force', '--echo', this.name], password);
+    if (!r.ok) {
+      throw new Error(`passage insert failed for ${this.name}${r.err ? `: ${r.err}` : ''}`);
+    }
+  }
+
+  deletePassword(): void {
+    if (!isSecretStoreAvailable()) {
+      throw new Error('passage secret store not available');
+    }
+    // Best-effort: `--force` suppresses errors for absent entries.
+    passageRun(['rm', '--force', this.name]);
   }
 }

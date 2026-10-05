@@ -21,7 +21,7 @@ describe('version comparison', () => {
 
   it('formats the npm update instruction', () => {
     expect(formatUpdateNotification('0.4.3', '0.4.4')).toBe(
-      '🔔 Update available: 0.4.3 → 0.4.4. Run npm install -g @jacobbd/relay-ai@latest to update.',
+      '🔔 Update available: 0.4.3 → 0.4.4. Run npm install -g @bendzgerona/relay-ai@latest to update.',
     );
   });
 });

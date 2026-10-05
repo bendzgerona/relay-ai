@@ -623,7 +623,7 @@ The SDK adapter proxy starts on a random local port for proxy-routed models and 
 
 ### API key storage
 
-relay-ai uses [`@napi-rs/keyring`](https://www.npmjs.com/package/@napi-rs/keyring) for the OS credential store. On later runs it checks silently. Key found? Wizard skips the prompt.
+relay-ai stores provider credentials in the OS credential store. On the pure-Bun/Termux build (`bun >=1.4`) `@napi-rs/keyring` (a native NAPI addon) is not usable, so secrets are backed by [`passage`](https://github.com/1Password/passage) — an age file store with no daemon — through the in-repo shim `src/secrets-backend.ts`. On later runs it checks silently. Key found? Wizard skips the prompt. `scripts/patch-napi-keyring.mjs` re-aliases any upstream `@napi-rs/keyring` imports to the shim after a sync.
 
 | Platform | Credential store | Notes |
 |----------|-----------------|-------|
@@ -631,8 +631,9 @@ relay-ai uses [`@napi-rs/keyring`](https://www.npmjs.com/package/@napi-rs/keyrin
 | Windows | Windows Credential Manager | `setx` available as plaintext alternative |
 | Linux (desktop) | Secret Service API (GNOME Keyring, KWallet) | Needs a running keyring daemon |
 | Linux (headless) | Not available | Falls back to shell profile or session-only |
+| Android / Termux | passage (age file store) | Pure-Bun; no D-Bus Secret Service daemon |
 
-If the native module fails to load, credential store options are skipped and you get shell profile / session-only storage.
+If the secret store backend is unavailable, credential store options are skipped and you get shell profile / session-only storage.
 
 ## Configuration
 

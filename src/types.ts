@@ -4,7 +4,7 @@ import type { FreeStatus } from './free-models.js';
 
 export type ModelFormat = 'anthropic' | 'openai' | 'unsupported';
 
-export type StarterCommand = 'root' | 'claude' | 'claude-app' | 'codex' | 'codex-app' | 'server' | 'models' | 'providers' | 'gemini' | 'agy' | 'antigravity' | 'antigravity-ide' | 'ui' | 'pi';
+export type StarterCommand = 'root' | 'claude' | 'claude-app' | 'codex' | 'codex-app' | 'server' | 'models' | 'providers' | 'gemini' | 'agy' | 'antigravity' | 'antigravity-ide' | 'ui';
 
 export interface BackendConfig {
   id: 'zen' | 'go';
